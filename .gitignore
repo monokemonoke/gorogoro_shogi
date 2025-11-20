@@ -1,0 +1,26 @@
+# Binaries and build outputs
+/gorogoro_openai
+/bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+*.log
+
+# Dependency/vendor dirs
+/vendor/
+
+# Coverage and profiling
+*.cov
+*.coverprofile
+*.prof
+*.pprof
+coverage.out
+
+# Editor cruft
+.DS_Store
+.vscode/
+.idea/

@@ -1,0 +1,508 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ごろごろ将棋 (5x6)</title>
+  <style>
+    :root {
+      --wood: #f2d696;
+      --border: #5c4424;
+      --highlight: #87cefa;
+      --drop: #ff9800;
+      --text: #2d1b0e;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      padding: 20px;
+      font-family: "Hiragino Sans", "Yu Gothic", sans-serif;
+      background: radial-gradient(circle at 20% 20%, #fffaf0, #f0e6d0);
+      color: var(--text);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 12px;
+      user-select: none;
+      -webkit-user-drag: none;
+    }
+    h1 {
+      margin: 0;
+      font-size: 24px;
+      letter-spacing: 0.05em;
+    }
+    #game-container {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 10px;
+    }
+    .hand {
+      width: 320px;
+      min-height: 60px;
+      background: #e8d0a9;
+      border: 2px solid var(--border);
+      display: flex;
+      flex-wrap: wrap;
+      padding: 6px;
+      gap: 6px;
+      align-items: center;
+      justify-content: center;
+      border-radius: 8px;
+    }
+    .hand-label {
+      width: 100%;
+      font-size: 12px;
+      text-align: center;
+      color: #5e3a12;
+      border-bottom: 1px solid var(--border);
+      margin-bottom: 2px;
+      padding-bottom: 2px;
+      pointer-events: none;
+    }
+    #board {
+      display: grid;
+      grid-template-columns: repeat(5, 64px);
+      grid-template-rows: repeat(6, 64px);
+      border: 2px solid #333;
+      background: var(--wood);
+      box-shadow: 0 4px 12px rgba(0,0,0,0.2);
+    }
+    .cell {
+      width: 64px;
+      height: 64px;
+      border: 1px solid #555;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      position: relative;
+      transition: background-color 0.15s ease;
+    }
+    .cell.selected { background: var(--highlight); }
+    .cell.valid::after {
+      content: "";
+      position: absolute;
+      width: 14px;
+      height: 14px;
+      background: rgba(255, 0, 0, 0.45);
+      border-radius: 50%;
+    }
+    .cell.drag-over {
+      background: #ffeb3b;
+      border-color: var(--drop);
+    }
+    .piece {
+      width: 54px;
+      height: 54px;
+      background: #ffefc0;
+      border: 1px solid #8b5a2b;
+      border-bottom: 3px solid #8b5a2b;
+      border-radius: 6px 6px 16px 16px;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      font-size: 26px;
+      font-weight: bold;
+      color: #000;
+      box-shadow: 1px 1px 3px rgba(0,0,0,0.3);
+      cursor: grab;
+      transition: transform 0.1s ease;
+    }
+    .piece:active { cursor: grabbing; }
+    .piece.gote { transform: rotate(180deg); }
+    .piece.promoted { color: #d00; }
+    .hand-piece { min-width: 60px; justify-content: space-between; padding: 0 8px; cursor: pointer; }
+    .hand-piece .count { font-size: 12px; }
+    .piece.selected-hand { background: var(--highlight); border-color: #0056b3; }
+    #status {
+      font-weight: bold;
+      font-size: 16px;
+    }
+    #message {
+      min-height: 18px;
+      color: #c00;
+      font-size: 14px;
+    }
+    .controls {
+      display: flex;
+      gap: 8px;
+    }
+    button {
+      padding: 8px 14px;
+      font-size: 14px;
+      cursor: pointer;
+      border: 1px solid var(--border);
+      background: #fff;
+      border-radius: 6px;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.2);
+    }
+  </style>
+</head>
+<body>
+  <h1>ごろごろ将棋 (5x6)</h1>
+  <div id="game-container">
+    <div id="gote-hand" class="hand">
+      <div class="hand-label">後手 (Top)</div>
+    </div>
+    <div id="board"></div>
+    <div id="sente-hand" class="hand">
+      <div class="hand-label">先手 (Bottom)</div>
+    </div>
+  </div>
+
+  <div id="status">読み込み中...</div>
+  <div id="message"></div>
+  <div class="controls">
+    <button id="reset-btn">最初からやり直す</button>
+    <button id="refresh-btn">再読込</button>
+  </div>
+
+  <script>
+    const ROWS = 6;
+    const COLS = 5;
+    const OWNER_BOTTOM = "bottom";
+    const OWNER_TOP = "top";
+
+    let state = null;
+    let selected = null; // {type: 'board'|'hand', x,y, kind}
+    let validMoves = [];
+    let movesForKey = "";
+
+    const kindToText = {
+      K: "王",
+      G: "金",
+      S: "銀",
+      P: "歩",
+      "": "",
+      "?": "?"
+    };
+
+    window.addEventListener("load", () => {
+      document.getElementById("reset-btn").onclick = resetGame;
+      document.getElementById("refresh-btn").onclick = loadState;
+      loadState();
+    });
+
+    async function loadState() {
+      try {
+        const payload = await fetchJSON("/api/state");
+        state = payload;
+        selected = null;
+        validMoves = [];
+        movesForKey = "";
+        render();
+        setMessage("");
+      } catch (err) {
+        setMessage(err.message || String(err));
+      }
+    }
+
+    async function resetGame() {
+      try {
+        const payload = await fetchJSON("/api/reset", { method: "POST" });
+        state = payload;
+        selected = null;
+        validMoves = [];
+        movesForKey = "";
+        render();
+        setMessage("リセットしました。");
+      } catch (err) {
+        setMessage(err.message || String(err));
+      }
+    }
+
+    function render() {
+      if (!state) return;
+      renderHands();
+      renderBoard();
+      updateStatus();
+    }
+
+    function renderHands() {
+      renderHand("gote-hand", OWNER_TOP);
+      renderHand("sente-hand", OWNER_BOTTOM);
+    }
+
+    function renderHand(elementId, owner) {
+      const handEl = document.getElementById(elementId);
+      handEl.innerHTML = `<div class="hand-label">${owner === OWNER_BOTTOM ? "先手 (Bottom)" : "後手 (Top)"}</div>`;
+      const hand = state.hands?.[owner] || {};
+      const entries = Object.entries(hand);
+      if (entries.length === 0) {
+        const empty = document.createElement("div");
+        empty.textContent = "なし";
+        empty.style.opacity = "0.6";
+        handEl.appendChild(empty);
+        return;
+      }
+      entries.forEach(([kind, count]) => {
+        const pieceEl = createPieceElement({ kind, owner, promoted: false, present: true });
+        pieceEl.classList.add("hand-piece");
+        pieceEl.title = `打つ (${count}枚)`;
+        const countEl = document.createElement("span");
+        countEl.className = "count";
+        countEl.textContent = `x${count}`;
+        pieceEl.appendChild(countEl);
+
+        pieceEl.draggable = true;
+        pieceEl.onclick = async (e) => {
+          e.stopPropagation();
+          if (state.turn !== owner) return;
+          await setSelection({ type: "hand", kind, owner });
+        };
+        pieceEl.ondragstart = async (e) => {
+          if (state.turn !== owner) {
+            e.preventDefault();
+            return;
+          }
+          await setSelection({ type: "hand", kind, owner });
+          e.dataTransfer.setData("text/plain", JSON.stringify({ kind, type: "hand" }));
+        };
+
+        if (selected && selected.type === "hand" && selected.kind === kind && selected.owner === owner) {
+          pieceEl.classList.add("selected-hand");
+        }
+
+        handEl.appendChild(pieceEl);
+      });
+    }
+
+    function renderBoard() {
+      const boardEl = document.getElementById("board");
+      boardEl.innerHTML = "";
+      for (let displayRow = ROWS - 1; displayRow >= 0; displayRow--) {
+        for (let x = 0; x < COLS; x++) {
+          const y = displayRow;
+          const cell = document.createElement("div");
+          cell.className = "cell";
+          const coord = coordToString(x, y);
+
+          if (selected && selected.type === "board" && selected.x === x && selected.y === y) {
+            cell.classList.add("selected");
+          }
+
+          if (isValidDestination(coord)) {
+            cell.classList.add("valid");
+          }
+
+          cell.onclick = async () => {
+            await onCellClick(x, y);
+          };
+          cell.ondragover = (e) => {
+            e.preventDefault();
+            e.dataTransfer.dropEffect = "move";
+          };
+          cell.ondragenter = (e) => {
+            e.preventDefault();
+            cell.classList.add("drag-over");
+          };
+          cell.ondragleave = () => cell.classList.remove("drag-over");
+          cell.ondrop = async (e) => {
+            e.preventDefault();
+            cell.classList.remove("drag-over");
+            const raw = e.dataTransfer.getData("text/plain");
+            if (raw) {
+              try {
+                const data = JSON.parse(raw);
+                if (data.type === "board") {
+                  await setSelection({ type: "board", x: data.x, y: data.y, owner: data.owner });
+                } else if (data.type === "hand") {
+                  await setSelection({ type: "hand", kind: data.kind, owner: state.turn });
+                }
+              } catch (_) {}
+            }
+            await attemptMove(x, y);
+          };
+
+          const piece = state.board && state.board[y] ? state.board[y][x] : null;
+          if (piece && piece.present) {
+            const pieceEl = createPieceElement(piece);
+            if (state.turn === piece.owner && !state.checkmate) {
+              pieceEl.draggable = true;
+              pieceEl.ondragstart = async (e) => {
+                await setSelection({ type: "board", x, y, owner: piece.owner });
+                e.dataTransfer.setData("text/plain", JSON.stringify({ type: "board", x, y, owner: piece.owner }));
+              };
+            }
+            pieceEl.onclick = async (e) => {
+              e.stopPropagation();
+              if (piece.owner !== state.turn) return;
+              await setSelection({ type: "board", x, y, owner: piece.owner });
+            };
+            cell.appendChild(pieceEl);
+          }
+
+          boardEl.appendChild(cell);
+        }
+      }
+    }
+
+    async function onCellClick(x, y) {
+      if (!state) return;
+      const piece = state.board[y][x];
+      if (!selected) {
+        if (piece?.present && piece.owner === state.turn) {
+          await setSelection({ type: "board", x, y, owner: piece.owner });
+        }
+        return;
+      }
+      await attemptMove(x, y);
+    }
+
+    async function attemptMove(x, y) {
+      if (!selected) return;
+      await ensureMovesLoaded();
+
+      const coord = coordToString(x, y);
+      const options = validMoves.filter((m) => m.to === coord);
+      if (options.length === 0) {
+        selected = null;
+        validMoves = [];
+        movesForKey = "";
+        render();
+        return;
+      }
+
+      let promote = options[0].promote;
+      const hasPromote = options.some((m) => m.promote);
+      const hasNoPromote = options.some((m) => !m.promote);
+      if (hasPromote && hasNoPromote) {
+        promote = window.confirm("成りますか？");
+      }
+
+      const payload = { to: coord, promote: !!promote };
+      if (selected.type === "board") {
+        payload.from = coordToString(selected.x, selected.y);
+      } else if (selected.type === "hand") {
+        payload.drop = selected.kind;
+      }
+
+      try {
+        const result = await fetchJSON("/api/move", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        if (!result.success) {
+          setMessage(result.error || "移動できません。");
+          state = result.state || state;
+        } else {
+          state = result.state;
+          setMessage(result.message || "");
+          if (result.winner) {
+            setMessage(`勝者: ${result.winner}`);
+          }
+        }
+      } catch (err) {
+        setMessage(err.message || String(err));
+      }
+
+      selected = null;
+      validMoves = [];
+      movesForKey = "";
+      render();
+    }
+
+    async function setSelection(sel) {
+      if (!state || state.turn !== sel.owner) {
+        selected = null;
+        validMoves = [];
+        movesForKey = "";
+        render();
+        return;
+      }
+      selected = sel;
+      await ensureMovesLoaded();
+      render();
+    }
+
+    async function ensureMovesLoaded() {
+      if (!selected) return;
+      const key = selectionKey(selected);
+      if (key === movesForKey && validMoves.length > 0) return;
+
+      let url = "/api/legal?";
+      if (selected.type === "board") {
+        url += `from=${encodeURIComponent(coordToString(selected.x, selected.y))}`;
+      } else {
+        url += `drop=${encodeURIComponent(selected.kind)}`;
+      }
+      try {
+        const data = await fetchJSON(url);
+        validMoves = data.moves || [];
+        movesForKey = key;
+      } catch (err) {
+        setMessage(err.message || String(err));
+        validMoves = [];
+        movesForKey = "";
+      }
+    }
+
+    function isValidDestination(coord) {
+      return validMoves.some((m) => m.to === coord);
+    }
+
+    function createPieceElement(piece) {
+      const pieceEl = document.createElement("div");
+      pieceEl.className = "piece";
+      if (piece.owner === OWNER_TOP) pieceEl.classList.add("gote");
+      if (piece.promoted) pieceEl.classList.add("promoted");
+      const baseText = kindToText[piece.kind] || "?";
+      pieceEl.textContent = piece.promoted ? (piece.kind === "S" ? "全" : piece.kind === "P" ? "と" : baseText) : baseText;
+      return pieceEl;
+    }
+
+    function updateStatus() {
+      const statusEl = document.getElementById("status");
+      if (!state) {
+        statusEl.textContent = "未接続";
+        return;
+      }
+      if (state.checkmate && state.winner) {
+        statusEl.textContent = `勝者: ${state.winner}`;
+        return;
+      }
+      const turnText = state.turn === OWNER_BOTTOM ? "先手" : "後手";
+      statusEl.textContent = `${turnText}の手番`;
+      if (state.check) {
+        statusEl.textContent += "（王手）";
+      }
+    }
+
+    function setMessage(msg) {
+      const el = document.getElementById("message");
+      el.textContent = msg || "";
+    }
+
+    function coordToString(x, y) {
+      return `${String.fromCharCode("a".charCodeAt(0) + x)}${y + 1}`;
+    }
+
+    function selectionKey(sel) {
+      if (!sel) return "";
+      if (sel.type === "hand") return `hand-${sel.owner}-${sel.kind}`;
+      return `board-${sel.owner}-${sel.x}-${sel.y}`;
+    }
+
+    async function fetchJSON(url, options = {}) {
+      const res = await fetch(url, options);
+      const text = await res.text();
+      let data = null;
+      if (text) {
+        try {
+          data = JSON.parse(text);
+        } catch (_) {
+          data = null;
+        }
+      }
+      if (!res.ok) {
+        const msg = (data && (data.error || data.message)) || text || res.statusText;
+        const err = new Error(msg);
+        err.data = data;
+        throw err;
+      }
+      return data;
+    }
+  </script>
+</body>
+</html>
