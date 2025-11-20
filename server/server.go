@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 
 	"gorogoro/game"
 )
@@ -15,12 +16,14 @@ type Server struct {
 	mu     sync.Mutex
 	game   game.GameState
 	static http.Handler
+	engine game.Engine
 }
 
 func New(staticFS http.FileSystem) *Server {
 	return &Server{
 		game:   game.NewGame(),
 		static: http.FileServer(staticFS),
+		engine: game.NewRandomEngine(time.Now().UnixNano()),
 	}
 }
 
@@ -161,17 +164,33 @@ func (s *Server) handleMove(w http.ResponseWriter, r *http.Request) {
 
 	s.game = applied
 	s.game.Turn = s.game.Turn.Opponent()
+	aiMessage, err := s.respondAsGoteIfNeeded()
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, moveResponse{
+			Success: false,
+			Error:   err.Error(),
+			State:   s.serializeState(s.game),
+		})
+		return
+	}
 
 	payload := s.serializeState(s.game)
 	resp := moveResponse{
 		Success: true,
 		State:   payload,
 	}
+	var notes []string
+	if aiMessage != "" {
+		notes = append(notes, aiMessage)
+	}
 	if payload.Checkmate {
-		resp.Message = "Checkmate"
+		notes = append(notes, "Checkmate")
 		resp.Winner = payload.Winner
 	} else if payload.Check {
-		resp.Message = "Check"
+		notes = append(notes, "Check")
+	}
+	if len(notes) > 0 {
+		resp.Message = strings.Join(notes, " / ")
 	}
 
 	writeJSON(w, http.StatusOK, resp)
@@ -276,6 +295,25 @@ func playerKey(p game.Player) string {
 		return "bottom"
 	}
 	return "top"
+}
+
+func (s *Server) respondAsGoteIfNeeded() (string, error) {
+	if s.engine == nil {
+		return "", nil
+	}
+	if s.game.Turn != game.Top {
+		return "", nil
+	}
+	if game.IsCheckmate(s.game, s.game.Turn) {
+		return "", nil
+	}
+	mv, err := s.engine.NextMove(s.game)
+	if err != nil {
+		return "", errors.New("failed to generate move for gote")
+	}
+	game.ApplyMove(&s.game, mv)
+	s.game.Turn = s.game.Turn.Opponent()
+	return "後手: " + game.FormatMove(mv), nil
 }
 
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {
