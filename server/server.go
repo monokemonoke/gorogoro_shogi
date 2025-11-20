@@ -17,14 +17,23 @@ type Server struct {
 	game   game.GameState
 	static http.Handler
 	engine game.Engine
+	mode   string
 }
 
+const (
+	engineRandom    = "random"
+	engineAlphaBeta = "alpha-beta"
+)
+
 func New(staticFS http.FileSystem) *Server {
-	return &Server{
+	s := &Server{
 		game:   game.NewGame(),
 		static: http.FileServer(staticFS),
-		engine: game.NewRandomEngine(time.Now().UnixNano()),
 	}
+	if err := s.setEngine(engineRandom); err != nil {
+		log.Printf("failed to initialize engine: %v", err)
+	}
+	return s
 }
 
 func (s *Server) Handler() http.Handler {
@@ -34,6 +43,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/legal", s.handleLegal)
 	mux.HandleFunc("/api/move", s.handleMove)
 	mux.HandleFunc("/api/reset", s.handleReset)
+	mux.HandleFunc("/api/engine", s.handleEngine)
 	return mux
 }
 
@@ -51,6 +61,7 @@ type statePayload struct {
 	Check     bool                      `json:"check"`
 	Checkmate bool                      `json:"checkmate"`
 	Winner    string                    `json:"winner,omitempty"`
+	Engine    string                    `json:"engine"`
 }
 
 type moveRequest struct {
@@ -210,6 +221,40 @@ func (s *Server) handleReset(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, payload)
 }
 
+type engineResponse struct {
+	Engine string `json:"engine"`
+}
+
+type engineRequest struct {
+	Engine string `json:"engine"`
+}
+
+func (s *Server) handleEngine(w http.ResponseWriter, r *http.Request) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	switch r.Method {
+	case http.MethodGet:
+		writeJSON(w, http.StatusOK, engineResponse{Engine: s.mode})
+		return
+	case http.MethodPost:
+		var payload engineRequest
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			http.Error(w, "invalid JSON body", http.StatusBadRequest)
+			return
+		}
+		if err := s.setEngine(payload.Engine); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		writeJSON(w, http.StatusOK, engineResponse{Engine: s.mode})
+		return
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+}
+
 func (s *Server) moveFromRequest(state game.GameState, req moveRequest) (game.Move, error) {
 	if req.Drop != "" && req.From != "" {
 		return game.Move{}, errors.New("specify either 'from' or 'drop', not both")
@@ -252,7 +297,8 @@ func (s *Server) serializeState(state game.GameState) statePayload {
 			"bottom": {},
 			"top":    {},
 		},
-		Turn: playerKey(state.Turn),
+		Turn:   playerKey(state.Turn),
+		Engine: s.mode,
 	}
 
 	for y := 0; y < game.BoardRows; y++ {
@@ -322,4 +368,17 @@ func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 	if err := json.NewEncoder(w).Encode(v); err != nil {
 		log.Printf("failed to write JSON response: %v", err)
 	}
+}
+
+func (s *Server) setEngine(kind string) error {
+	switch kind {
+	case engineRandom:
+		s.engine = game.NewRandomEngine(time.Now().UnixNano())
+	case engineAlphaBeta:
+		s.engine = game.NewAlphaBetaEngine(3)
+	default:
+		return errors.New("unknown engine requested")
+	}
+	s.mode = kind
+	return nil
 }

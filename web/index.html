@@ -127,6 +127,19 @@
       display: flex;
       gap: 8px;
     }
+    .controls label {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 14px;
+    }
+    select {
+      padding: 6px 10px;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      background: #fffef6;
+      font-size: 14px;
+    }
     button {
       padding: 8px 14px;
       font-size: 14px;
@@ -153,6 +166,12 @@
   <div id="status">読み込み中...</div>
   <div id="message"></div>
   <div class="controls">
+    <label>後手AI
+      <select id="engine-select">
+        <option value="random">ランダム</option>
+        <option value="alpha-beta">αβ探索</option>
+      </select>
+    </label>
     <button id="reset-btn">最初からやり直す</button>
     <button id="refresh-btn">再読込</button>
   </div>
@@ -180,21 +199,26 @@
     window.addEventListener("load", () => {
       document.getElementById("reset-btn").onclick = resetGame;
       document.getElementById("refresh-btn").onclick = loadState;
+      document.getElementById("engine-select").onchange = onEngineChange;
       loadState();
     });
 
     async function loadState() {
       try {
-        const payload = await fetchJSON("/api/state");
-        state = payload;
-        selected = null;
-        validMoves = [];
-        movesForKey = "";
-        render();
+        await fetchAndRenderState();
         setMessage("");
       } catch (err) {
         setMessage(err.message || String(err));
       }
+    }
+
+    async function fetchAndRenderState() {
+      const payload = await fetchJSON("/api/state");
+      state = payload;
+      selected = null;
+      validMoves = [];
+      movesForKey = "";
+      render();
     }
 
     async function resetGame() {
@@ -211,11 +235,31 @@
       }
     }
 
+    async function onEngineChange(e) {
+      const select = e.target;
+      const choice = select.value;
+      try {
+        await fetchJSON("/api/engine", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ engine: choice })
+        });
+        await fetchAndRenderState();
+        setMessage("後手AIを切り替えました。");
+      } catch (err) {
+        setMessage(err.message || String(err));
+        if (state?.engine) {
+          select.value = state.engine;
+        }
+      }
+    }
+
     function render() {
       if (!state) return;
       renderHands();
       renderBoard();
       updateStatus();
+      updateEngineSelector();
     }
 
     function renderHands() {
@@ -472,6 +516,12 @@
     function setMessage(msg) {
       const el = document.getElementById("message");
       el.textContent = msg || "";
+    }
+
+    function updateEngineSelector() {
+      const select = document.getElementById("engine-select");
+      if (!select || !state?.engine) return;
+      select.value = state.engine;
     }
 
     function coordToString(x, y) {
