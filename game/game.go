@@ -968,3 +968,65 @@ func IsCheckmate(state GameState, player Player) bool {
 	}
 	return len(GenerateLegalMoves(state, player)) == 0
 }
+
+// MateSearch performs a minimax search limited by depth (in plies) to detect a forced mate.
+// It returns the winning line starting from the current state if the attacker can force mate.
+func MateSearch(state GameState, attacker Player, depth int) (bool, []Move) {
+	if depth <= 0 {
+		return false, nil
+	}
+	defender := attacker.Opponent()
+	return mateSearch(state, attacker, defender, depth)
+}
+
+func mateSearch(state GameState, attacker, defender Player, depth int) (bool, []Move) {
+	if depth == 0 {
+		return false, nil
+	}
+
+	player := state.Turn
+	moves := GenerateLegalMoves(state, player)
+
+	if len(moves) == 0 {
+		if player == defender && InCheck(state, defender) {
+			return true, nil
+		}
+		return false, nil
+	}
+
+	if player == attacker {
+		for _, mv := range moves {
+			next := CloneState(state)
+			ApplyMove(&next, mv)
+			next.Turn = player.Opponent()
+
+			if IsCheckmate(next, defender) {
+				return true, []Move{mv}
+			}
+			found, line := mateSearch(next, attacker, defender, depth-1)
+			if found {
+				return true, append([]Move{mv}, line...)
+			}
+		}
+		return false, nil
+	}
+
+	var forcedLine []Move
+	for _, mv := range moves {
+		next := CloneState(state)
+		ApplyMove(&next, mv)
+		next.Turn = player.Opponent()
+
+		found, line := mateSearch(next, attacker, defender, depth-1)
+		if !found {
+			return false, nil
+		}
+		if forcedLine == nil {
+			forcedLine = append([]Move{mv}, line...)
+		}
+	}
+	if forcedLine == nil {
+		forcedLine = []Move{}
+	}
+	return true, forcedLine
+}
