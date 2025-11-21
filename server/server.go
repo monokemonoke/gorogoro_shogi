@@ -13,11 +13,12 @@ import (
 )
 
 type Server struct {
-	mu     sync.Mutex
-	game   game.GameState
-	static http.Handler
-	engine game.Engine
-	mode   string
+	mu      sync.Mutex
+	game    game.GameState
+	history []historyEntry
+	static  http.Handler
+	engine  game.Engine
+	mode    string
 }
 
 const (
@@ -62,6 +63,12 @@ type statePayload struct {
 	Checkmate bool                      `json:"checkmate"`
 	Winner    string                    `json:"winner,omitempty"`
 	Engine    string                    `json:"engine"`
+	History   []historyEntry            `json:"history"`
+}
+
+type historyEntry struct {
+	Player string `json:"player"`
+	Move   string `json:"move"`
 }
 
 type moveRequest struct {
@@ -173,7 +180,9 @@ func (s *Server) handleMove(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	movingPlayer := s.game.Turn
 	s.game = applied
+	s.recordMove(movingPlayer, mv)
 	s.game.Turn = s.game.Turn.Opponent()
 	aiMessage, err := s.respondAsGoteIfNeeded()
 	if err != nil {
@@ -215,6 +224,7 @@ func (s *Server) handleReset(w http.ResponseWriter, r *http.Request) {
 
 	s.mu.Lock()
 	s.game = game.NewGame()
+	s.history = nil
 	payload := s.serializeState(s.game)
 	s.mu.Unlock()
 
@@ -297,8 +307,9 @@ func (s *Server) serializeState(state game.GameState) statePayload {
 			"bottom": {},
 			"top":    {},
 		},
-		Turn:   playerKey(state.Turn),
-		Engine: s.mode,
+		Turn:    playerKey(state.Turn),
+		Engine:  s.mode,
+		History: append([]historyEntry(nil), s.history...),
 	}
 
 	for y := 0; y < game.BoardRows; y++ {
@@ -353,13 +364,22 @@ func (s *Server) respondAsGoteIfNeeded() (string, error) {
 	if game.IsCheckmate(s.game, s.game.Turn) {
 		return "", nil
 	}
+	currentPlayer := s.game.Turn
 	mv, err := s.engine.NextMove(s.game)
 	if err != nil {
 		return "", errors.New("failed to generate move for gote")
 	}
 	game.ApplyMove(&s.game, mv)
+	s.recordMove(currentPlayer, mv)
 	s.game.Turn = s.game.Turn.Opponent()
 	return "後手: " + game.FormatMove(mv), nil
+}
+
+func (s *Server) recordMove(player game.Player, mv game.Move) {
+	s.history = append(s.history, historyEntry{
+		Player: playerKey(player),
+		Move:   game.FormatMove(mv),
+	})
 }
 
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {

@@ -31,6 +31,54 @@
       font-size: 24px;
       letter-spacing: 0.05em;
     }
+    #main-layout {
+      display: flex;
+      gap: 20px;
+      align-items: flex-start;
+      justify-content: center;
+      flex-wrap: wrap;
+      width: min(100%, 900px);
+    }
+    #record-panel {
+      width: 200px;
+      background: #f7e6c1;
+      border: 2px solid var(--border);
+      border-radius: 8px;
+      padding: 10px;
+      box-shadow: 0 4px 10px rgba(0,0,0,0.15);
+    }
+    .panel-title {
+      font-size: 14px;
+      font-weight: bold;
+      text-align: center;
+      margin-bottom: 6px;
+      color: #5e3a12;
+    }
+    #history-wrapper {
+      max-height: 420px;
+      overflow-y: auto;
+    }
+    #history-list {
+      list-style: decimal;
+      list-style-position: inside;
+      margin: 0;
+      padding-left: 18px;
+      font-size: 14px;
+    }
+    #history-list li {
+      padding: 4px;
+      border-radius: 4px;
+      background: rgba(255, 255, 255, 0.6);
+    }
+    #history-list li + li {
+      margin-top: 4px;
+    }
+    #history-empty {
+      text-align: center;
+      font-size: 13px;
+      color: #7a6644;
+      padding: 8px 0;
+    }
     #game-container {
       display: flex;
       flex-direction: column;
@@ -153,13 +201,22 @@
 </head>
 <body>
   <h1>ごろごろ将棋 (5x6)</h1>
-  <div id="game-container">
-    <div id="gote-hand" class="hand">
-      <div class="hand-label">後手 (Top)</div>
+  <div id="main-layout">
+    <div id="record-panel">
+      <div class="panel-title">棋譜</div>
+      <div id="history-wrapper">
+        <ol id="history-list"></ol>
+      </div>
+      <div id="history-empty">まだ指し手はありません</div>
     </div>
-    <div id="board"></div>
-    <div id="sente-hand" class="hand">
-      <div class="hand-label">先手 (Bottom)</div>
+    <div id="game-container">
+      <div id="gote-hand" class="hand">
+        <div class="hand-label">後手 (Top)</div>
+      </div>
+      <div id="board"></div>
+      <div id="sente-hand" class="hand">
+        <div class="hand-label">先手 (Bottom)</div>
+      </div>
     </div>
   </div>
 
@@ -258,8 +315,29 @@
       if (!state) return;
       renderHands();
       renderBoard();
+      renderHistory();
       updateStatus();
       updateEngineSelector();
+    }
+
+    function renderHistory() {
+      const list = document.getElementById("history-list");
+      const emptyEl = document.getElementById("history-empty");
+      if (!list || !emptyEl) return;
+      list.innerHTML = "";
+      const entries = state.history || [];
+      if (entries.length === 0) {
+        emptyEl.style.display = "block";
+        return;
+      }
+      emptyEl.style.display = "none";
+      entries.forEach((entry) => {
+        const item = document.createElement("li");
+        const label = entry.player === OWNER_BOTTOM ? "先手" : "後手";
+        item.textContent = `${label} ${entry.move}`;
+        list.appendChild(item);
+      });
+      list.scrollTop = list.scrollHeight;
     }
 
     function renderHands() {
