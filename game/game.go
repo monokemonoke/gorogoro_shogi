@@ -485,7 +485,7 @@ func legalMovesForPiece(state GameState, from Coord, piece Piece) []Move {
 			testMove := Move{From: &from, To: to, Promote: promote}
 			testState := CloneState(state)
 			ApplyMove(&testState, testMove)
-			if !InCheck(testState, player) {
+			if !InCheck(testState, player) && pieceHasBoardReach(testState.Board[to.Y][to.X], to) {
 				moves = append(moves, testMove)
 			}
 		}
@@ -494,21 +494,58 @@ func legalMovesForPiece(state GameState, from Coord, piece Piece) []Move {
 }
 
 func legalDropsForPiece(state GameState, player Player, pieceKind PieceType) []Move {
+	// Pawn drops are blocked on files that already contain an unpromoted pawn of the same player (nifu).
+	blockedColumns := map[int]bool{}
+	if pieceKind == Pawn {
+		for x := 0; x < BoardCols; x++ {
+			blockedColumns[x] = columnHasUnpromotedPawn(state, player, x)
+		}
+	}
 	var moves []Move
 	for y := 0; y < BoardRows; y++ {
 		for x := 0; x < BoardCols; x++ {
 			if state.Board[y][x].Present {
 				continue
 			}
+			if blockedColumns[x] {
+				continue
+			}
 			testMove := Move{Drop: &pieceKind, To: Coord{X: x, Y: y}}
 			testState := CloneState(state)
 			ApplyMove(&testState, testMove)
-			if !InCheck(testState, player) {
+			if !InCheck(testState, player) && pieceHasBoardReach(testState.Board[y][x], testMove.To) {
 				moves = append(moves, testMove)
 			}
 		}
 	}
 	return moves
+}
+
+// pieceHasBoardReach ensures the piece still has at least one theoretical destination on the board.
+func pieceHasBoardReach(piece Piece, at Coord) bool {
+	if !piece.Present {
+		return false
+	}
+	for _, delta := range movementOffsets(piece) {
+		target := Coord{X: at.X + delta.X, Y: at.Y + delta.Y}
+		if insideBoard(target) {
+			return true
+		}
+	}
+	return false
+}
+
+func columnHasUnpromotedPawn(state GameState, player Player, column int) bool {
+	for y := 0; y < BoardRows; y++ {
+		p := state.Board[y][column]
+		if !p.Present {
+			continue
+		}
+		if p.Owner == player && p.Kind == Pawn && !p.Promoted {
+			return true
+		}
+	}
+	return false
 }
 
 func insideBoard(c Coord) bool {
