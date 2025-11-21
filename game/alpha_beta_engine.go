@@ -9,10 +9,14 @@ import (
 // AlphaBetaEngine performs a depth-limited minimax search with alpha-beta pruning.
 type AlphaBetaEngine struct {
 	Depth int
+	table map[stateKey]ttEntry
 }
 
 func NewAlphaBetaEngine(depth int) *AlphaBetaEngine {
-	return &AlphaBetaEngine{Depth: depth}
+	return &AlphaBetaEngine{
+		Depth: depth,
+		table: make(map[stateKey]ttEntry),
+	}
 }
 
 type boundType int
@@ -47,18 +51,20 @@ func (e *AlphaBetaEngine) NextMove(state GameState) (Move, error) {
 	if len(moves) == 0 {
 		return Move{}, errors.New("no legal moves to play")
 	}
-	table := make(map[stateKey]ttEntry)
-	_, best := e.search(state, e.Depth, -infiniteScore, infiniteScore, state.Turn, table)
+	if e.table == nil {
+		e.table = make(map[stateKey]ttEntry)
+	}
+	_, best := e.search(state, e.Depth, -infiniteScore, infiniteScore, state.Turn)
 	if best == nil {
 		return Move{}, errors.New("failed to find a move")
 	}
 	return *best, nil
 }
 
-func (e *AlphaBetaEngine) search(state GameState, depth int, alpha, beta int, maximizer Player, table map[stateKey]ttEntry) (int, *Move) {
+func (e *AlphaBetaEngine) search(state GameState, depth int, alpha, beta int, maximizer Player) (int, *Move) {
 	alphaOrig, betaOrig := alpha, beta
 	key := makeStateKey(state, maximizer)
-	if entry, ok := table[key]; ok && entry.depth >= depth {
+	if entry, ok := e.table[key]; ok && entry.depth >= depth {
 		switch entry.bound {
 		case boundExact:
 			return entry.score, duplicateEntryMove(entry)
@@ -78,14 +84,14 @@ func (e *AlphaBetaEngine) search(state GameState, depth int, alpha, beta int, ma
 
 	if depth == 0 {
 		score := e.evaluate(state, maximizer, depth)
-		table[key] = ttEntry{depth: depth, score: score, bound: boundExact}
+		e.table[key] = ttEntry{depth: depth, score: score, bound: boundExact}
 		return score, nil
 	}
 
 	legal := GenerateLegalMoves(state, state.Turn)
 	if len(legal) == 0 {
 		score := e.evaluate(state, maximizer, depth)
-		table[key] = ttEntry{depth: depth, score: score, bound: boundExact}
+		e.table[key] = ttEntry{depth: depth, score: score, bound: boundExact}
 		return score, nil
 	}
 
@@ -97,7 +103,7 @@ func (e *AlphaBetaEngine) search(state GameState, depth int, alpha, beta int, ma
 			ApplyMove(&next, mv)
 			next.Turn = next.Turn.Opponent()
 
-			score, _ := e.search(next, depth-1, alpha, beta, maximizer, table)
+			score, _ := e.search(next, depth-1, alpha, beta, maximizer)
 			if score > bestScore {
 				bestScore = score
 				mvCopy := mv
@@ -111,7 +117,7 @@ func (e *AlphaBetaEngine) search(state GameState, depth int, alpha, beta int, ma
 			}
 		}
 		bound := determineBound(bestScore, alphaOrig, betaOrig)
-		table[key] = makeEntry(bestScore, depth, bound, chosen)
+		e.table[key] = makeEntry(bestScore, depth, bound, chosen)
 		return bestScore, chosen
 	}
 
@@ -121,7 +127,7 @@ func (e *AlphaBetaEngine) search(state GameState, depth int, alpha, beta int, ma
 		ApplyMove(&next, mv)
 		next.Turn = next.Turn.Opponent()
 
-		score, _ := e.search(next, depth-1, alpha, beta, maximizer, table)
+		score, _ := e.search(next, depth-1, alpha, beta, maximizer)
 		if score < bestScore {
 			bestScore = score
 			mvCopy := mv
@@ -135,7 +141,7 @@ func (e *AlphaBetaEngine) search(state GameState, depth int, alpha, beta int, ma
 		}
 	}
 	bound := determineBound(bestScore, alphaOrig, betaOrig)
-	table[key] = makeEntry(bestScore, depth, bound, chosen)
+	e.table[key] = makeEntry(bestScore, depth, bound, chosen)
 	return bestScore, chosen
 }
 
