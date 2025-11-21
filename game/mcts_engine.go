@@ -1,9 +1,16 @@
 package game
 
 import (
+	"encoding/json"
 	"errors"
+	"log"
 	"math"
 	"math/rand"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
 )
 
 const (
@@ -12,29 +19,62 @@ const (
 	mctsRolloutDepth       = 60
 )
 
+type moveStats struct {
+	Visits int     `json:"visits"`
+	Wins   float64 `json:"wins"`
+}
+
+type storedKnowledge struct {
+	States map[string]map[string]moveStats `json:"states"`
+}
+
 type MCTSEngine struct {
 	iterations  int
 	exploration float64
 	rng         *rand.Rand
+	storagePath string
+	knowledge   map[string]map[string]moveStats
+	dirty       bool
+	mu          sync.Mutex
 }
 
 func NewMCTSEngine(iterations int, seed int64) *MCTSEngine {
+	return NewPersistentMCTSEngine(iterations, seed, "")
+}
+
+func NewPersistentMCTSEngine(iterations int, seed int64, storagePath string) *MCTSEngine {
 	if iterations <= 0 {
 		iterations = defaultMCTSIterations
 	}
-	return &MCTSEngine{
+	engine := &MCTSEngine{
 		iterations:  iterations,
 		exploration: defaultMCTSExploration,
 		rng:         rand.New(rand.NewSource(seed)),
+		storagePath: storagePath,
+		knowledge:   make(map[string]map[string]moveStats),
 	}
+	if err := engine.loadKnowledge(); err != nil {
+		log.Printf("mcts: failed to load knowledge: %v", err)
+	}
+	return engine
+}
+
+func (e *MCTSEngine) SaveIfNeeded() error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.saveLocked()
 }
 
 func (e *MCTSEngine) NextMove(state GameState) (Move, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
 	legal := GenerateLegalMoves(state, state.Turn)
 	if len(legal) == 0 {
 		return Move{}, errors.New("no legal moves to play")
 	}
 	root := newMCTSNode(CloneState(state), nil, nil)
+	e.applyPriorKnowledge(root)
 	rootPlayer := state.Turn
 	for i := 0; i < e.iterations; i++ {
 		node := root
@@ -51,6 +91,7 @@ func (e *MCTSEngine) NextMove(state GameState) (Move, error) {
 	if best == nil || best.move == nil {
 		return Move{}, errors.New("failed to choose move")
 	}
+	e.updateKnowledgeFromRoot(root)
 	return *best.move, nil
 }
 
@@ -169,4 +210,122 @@ func (e *MCTSEngine) rollout(state GameState, root Player) (Player, bool) {
 	default:
 		return root, false
 	}
+}
+
+func (e *MCTSEngine) applyPriorKnowledge(root *mctsNode) {
+	if e.storagePath == "" {
+		return
+	}
+	key := encodeStateKey(root.state)
+	entries, ok := e.knowledge[key]
+	if !ok || len(entries) == 0 {
+		return
+	}
+	var remaining []Move
+	for _, mv := range root.untried {
+		stats, ok := entries[FormatMove(mv)]
+		if !ok {
+			remaining = append(remaining, mv)
+			continue
+		}
+		childState := CloneState(root.state)
+		ApplyMove(&childState, mv)
+		childState.Turn = childState.Turn.Opponent()
+		mvCopy := mv
+		child := newMCTSNode(childState, &mvCopy, root)
+		child.visits = stats.Visits
+		child.wins = stats.Wins
+		root.children = append(root.children, child)
+	}
+	root.untried = remaining
+}
+
+func (e *MCTSEngine) updateKnowledgeFromRoot(root *mctsNode) {
+	if e.storagePath == "" {
+		return
+	}
+	key := encodeStateKey(root.state)
+	entries := make(map[string]moveStats)
+	for _, child := range root.children {
+		if child.move == nil {
+			continue
+		}
+		entries[FormatMove(*child.move)] = moveStats{
+			Visits: child.visits,
+			Wins:   child.wins,
+		}
+	}
+	e.knowledge[key] = entries
+	e.dirty = true
+}
+
+func (e *MCTSEngine) loadKnowledge() error {
+	if e.storagePath == "" {
+		return nil
+	}
+	data, err := os.ReadFile(e.storagePath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	var payload storedKnowledge
+	if err := json.Unmarshal(data, &payload); err != nil {
+		return err
+	}
+	if payload.States != nil {
+		e.knowledge = payload.States
+	}
+	return nil
+}
+
+func (e *MCTSEngine) saveLocked() error {
+	if e.storagePath == "" || !e.dirty {
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(e.storagePath), 0o755); err != nil {
+		return err
+	}
+	payload := storedKnowledge{States: e.knowledge}
+	data, err := json.MarshalIndent(payload, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(e.storagePath, data, 0o644); err != nil {
+		return err
+	}
+	e.dirty = false
+	return nil
+}
+
+func encodeStateKey(state GameState) string {
+	var b strings.Builder
+	b.Grow(BoardRows*BoardCols*3 + 32)
+	b.WriteByte(byte('0' + byte(state.Turn)))
+	for y := 0; y < BoardRows; y++ {
+		for x := 0; x < BoardCols; x++ {
+			p := state.Board[y][x]
+			if !p.Present {
+				b.WriteByte('.')
+				continue
+			}
+			b.WriteByte(byte('0' + byte(p.Owner)))
+			b.WriteByte(byte('0' + byte(p.Kind)))
+			if p.Promoted {
+				b.WriteByte('1')
+			} else {
+				b.WriteByte('0')
+			}
+		}
+	}
+	for _, player := range []Player{Bottom, Top} {
+		b.WriteByte('|')
+		for _, piece := range []PieceType{King, Gold, Silver, Pawn} {
+			count := state.Hands[player][piece]
+			b.WriteString(strconv.Itoa(count))
+			b.WriteByte(',')
+		}
+	}
+	return b.String()
 }

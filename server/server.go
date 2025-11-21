@@ -3,8 +3,11 @@ package server
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -20,6 +23,7 @@ type Server struct {
 	static  http.Handler
 	engines map[game.Player]game.Engine
 	modes   map[game.Player]string
+	dataDir string
 	auto    struct {
 		active   bool
 		stopCh   chan struct{}
@@ -34,9 +38,21 @@ const (
 	engineMCTS              = "mcts"
 	engineHuman             = "human"
 	defaultAutoInterval     = 1500 * time.Millisecond
+	defaultDataDir          = "data"
 )
 
-func New(staticFS http.FileSystem) *Server {
+type Config struct {
+	DataDir string
+}
+
+func New(staticFS http.FileSystem, cfg Config) *Server {
+	dataDir := strings.TrimSpace(cfg.DataDir)
+	if dataDir == "" {
+		dataDir = defaultDataDir
+	}
+	if err := os.MkdirAll(dataDir, 0o755); err != nil {
+		log.Printf("failed to create data directory %q: %v", dataDir, err)
+	}
 	s := &Server{
 		game:   game.NewGame(),
 		static: http.FileServer(staticFS),
@@ -48,6 +64,7 @@ func New(staticFS http.FileSystem) *Server {
 			game.Bottom: engineHuman,
 			game.Top:    engineRandom,
 		},
+		dataDir: dataDir,
 	}
 	s.initial = s.makeBoardPayload(s.game)
 	if err := s.setEngine(game.Top, engineRandom); err != nil {
@@ -244,6 +261,7 @@ func (s *Server) handleMove(w http.ResponseWriter, r *http.Request) {
 	if payload.Checkmate {
 		notes = append(notes, "Checkmate")
 		resp.Winner = payload.Winner
+		s.flushEngineDataLocked()
 	} else if payload.Check {
 		notes = append(notes, "Check")
 	}
@@ -262,6 +280,7 @@ func (s *Server) handleReset(w http.ResponseWriter, r *http.Request) {
 
 	s.mu.Lock()
 	s.stopAutoPlayLocked()
+	s.flushEngineDataLocked()
 	s.game = game.NewGame()
 	s.history = nil
 	s.initial = s.makeBoardPayload(s.game)
@@ -503,6 +522,27 @@ func (s *Server) recordMove(player game.Player, mv game.Move, snapshot boardPayl
 	})
 }
 
+type savableEngine interface {
+	SaveIfNeeded() error
+}
+
+func saveEngineData(eng game.Engine) {
+	if eng == nil {
+		return
+	}
+	if saver, ok := eng.(savableEngine); ok {
+		if err := saver.SaveIfNeeded(); err != nil {
+			log.Printf("failed to save engine data: %v", err)
+		}
+	}
+}
+
+func (s *Server) flushEngineDataLocked() {
+	for _, eng := range s.engines {
+		saveEngineData(eng)
+	}
+}
+
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
@@ -524,10 +564,12 @@ func (s *Server) engineStatus() engineResponse {
 func (s *Server) setEngine(player game.Player, kind string) error {
 	mode := strings.TrimSpace(kind)
 	if mode == "" || mode == engineHuman {
+		saveEngineData(s.engines[player])
 		s.engines[player] = nil
 		s.modes[player] = engineHuman
 		return nil
 	}
+	saveEngineData(s.engines[player])
 	var eng game.Engine
 	switch mode {
 	case engineRandom:
@@ -537,7 +579,8 @@ func (s *Server) setEngine(player game.Player, kind string) error {
 	case engineAlphaBetaMobility:
 		eng = game.NewMobilityAlphaBetaEngine(3)
 	case engineMCTS:
-		eng = game.NewMCTSEngine(800, time.Now().UnixNano())
+		path := filepath.Join(s.dataDir, fmt.Sprintf("mcts_%s.json", playerKey(player)))
+		eng = game.NewPersistentMCTSEngine(800, time.Now().UnixNano(), path)
 	default:
 		return errors.New("unknown engine requested")
 	}
@@ -589,6 +632,7 @@ func (s *Server) runAutoPlay(stop <-chan struct{}, interval time.Duration) {
 				return
 			}
 			if mate, _ := game.CheckmateStatus(s.game); mate {
+				s.flushEngineDataLocked()
 				s.auto.active = false
 				s.auto.stopCh = nil
 				s.mu.Unlock()
@@ -613,6 +657,9 @@ func (s *Server) runAutoPlay(stop <-chan struct{}, interval time.Duration) {
 			game.ApplyMove(&s.game, mv)
 			s.game.Turn = s.game.Turn.Opponent()
 			s.recordMove(movingPlayer, mv, s.makeBoardPayload(s.game))
+			if mate, _ := game.CheckmateStatus(s.game); mate {
+				s.flushEngineDataLocked()
+			}
 			s.mu.Unlock()
 		}
 	}
