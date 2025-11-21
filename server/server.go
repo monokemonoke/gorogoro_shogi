@@ -637,37 +637,51 @@ func (s *Server) respondWithEngines() ([]string, error) {
 			s.mu.Unlock()
 			break
 		}
-		if mate, _ := game.CheckmateStatus(s.game); mate {
-			s.mu.Unlock()
-			break
-		}
-		engine := s.engines[s.game.Turn]
-		if engine == nil {
-			s.mu.Unlock()
-			break
-		}
-		currentPlayer := s.game.Turn
-		stateCopy := cloneGameState(s.game)
-		s.mu.Unlock()
-
-		mv, err := engine.NextMove(stateCopy)
+		resp, moved, err := s.advanceEngineMoveLocked(false)
 		if err != nil {
-			return responses, errors.New("failed to generate move for " + playerLabel(currentPlayer))
-		}
-
-		s.mu.Lock()
-		if s.auto.active || s.game.Turn != currentPlayer || s.engines[currentPlayer] != engine {
 			s.mu.Unlock()
-			continue
+			return responses, err
 		}
-		game.ApplyMove(&s.game, mv)
-		s.game.Turn = s.game.Turn.Opponent()
-		s.recordMove(currentPlayer, mv, s.makeBoardPayload(s.game))
+		if !moved {
+			s.mu.Unlock()
+			break
+		}
 		s.mu.Unlock()
-
-		responses = append(responses, playerLabel(currentPlayer)+": "+game.FormatMove(mv))
+		responses = append(responses, resp)
 	}
 	return responses, nil
+}
+
+// advanceEngineMoveLocked plays a single engine move. The lock must be held by the caller
+// and remains held on return. The method temporarily releases the lock while asking the
+// engine for a move so slow engines do not block other requests.
+func (s *Server) advanceEngineMoveLocked(allowAuto bool) (string, bool, error) {
+	if mate, _ := game.CheckmateStatus(s.game); mate {
+		return "", false, nil
+	}
+	engine := s.engines[s.game.Turn]
+	if engine == nil {
+		return "", false, nil
+	}
+	currentPlayer := s.game.Turn
+	stateCopy := cloneGameState(s.game)
+	s.mu.Unlock()
+
+	mv, err := engine.NextMove(stateCopy)
+	s.mu.Lock()
+	if err != nil {
+		return "", false, errors.New("failed to generate move for " + playerLabel(currentPlayer))
+	}
+	if (!allowAuto && s.auto.active) || s.game.Turn != currentPlayer || s.engines[currentPlayer] != engine {
+		return "", false, nil
+	}
+	game.ApplyMove(&s.game, mv)
+	s.game.Turn = s.game.Turn.Opponent()
+	s.recordMove(currentPlayer, mv, s.makeBoardPayload(s.game))
+	if mate, _ := game.CheckmateStatus(s.game); mate {
+		s.flushEngineDataLocked()
+	}
+	return playerLabel(currentPlayer) + ": " + game.FormatMove(mv), true, nil
 }
 
 func cloneGameState(state game.GameState) game.GameState {
@@ -685,7 +699,6 @@ func cloneGameState(state game.GameState) game.GameState {
 	}
 	return clone
 }
-
 func (s *Server) recordMove(player game.Player, mv game.Move, snapshot boardPayload) {
 	s.history = append(s.history, historyEntry{
 		Player:   playerKey(player),
@@ -823,27 +836,17 @@ func (s *Server) runAutoPlay(stop <-chan struct{}, interval time.Duration) {
 				s.mu.Unlock()
 				return
 			}
-			engine := s.engines[s.game.Turn]
-			if engine == nil {
-				s.auto.active = false
-				s.auto.stopCh = nil
-				s.mu.Unlock()
-				return
-			}
-			mv, err := engine.NextMove(s.game)
-			if err != nil {
+			if _, moved, err := s.advanceEngineMoveLocked(true); err != nil {
 				log.Printf("auto play failed: %v", err)
 				s.auto.active = false
 				s.auto.stopCh = nil
 				s.mu.Unlock()
 				return
-			}
-			movingPlayer := s.game.Turn
-			game.ApplyMove(&s.game, mv)
-			s.game.Turn = s.game.Turn.Opponent()
-			s.recordMove(movingPlayer, mv, s.makeBoardPayload(s.game))
-			if mate, _ := game.CheckmateStatus(s.game); mate {
-				s.flushEngineDataLocked()
+			} else if !moved {
+				s.auto.active = false
+				s.auto.stopCh = nil
+				s.mu.Unlock()
+				return
 			}
 			s.mu.Unlock()
 		}
