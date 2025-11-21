@@ -25,3 +25,6 @@ coverage.out
 .DS_Store
 .vscode/
 .idea/
+
+# Custom file
+data/*
