@@ -213,24 +213,27 @@ func (s *Server) handleMove(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	defer s.mu.Unlock()
 
 	mv, err := s.moveFromRequest(s.game, req)
 	if err != nil {
+		payload := s.serializeState(s.game)
+		s.mu.Unlock()
 		writeJSON(w, http.StatusBadRequest, moveResponse{
 			Success: false,
 			Error:   err.Error(),
-			State:   s.serializeState(s.game),
+			State:   payload,
 		})
 		return
 	}
 
 	legal, applied := game.TryApplyMove(s.game, mv)
 	if !legal {
+		payload := s.serializeState(s.game)
+		s.mu.Unlock()
 		writeJSON(w, http.StatusBadRequest, moveResponse{
 			Success: false,
 			Error:   "illegal move",
-			State:   s.serializeState(s.game),
+			State:   payload,
 		})
 		return
 	}
@@ -239,17 +242,29 @@ func (s *Server) handleMove(w http.ResponseWriter, r *http.Request) {
 	s.game = applied
 	s.game.Turn = s.game.Turn.Opponent()
 	s.recordMove(movingPlayer, mv, s.makeBoardPayload(s.game))
-	responses, err := s.respondWithEnginesLocked()
+	s.mu.Unlock()
+
+	responses, err := s.respondWithEngines()
 	if err != nil {
+		s.mu.Lock()
+		payload := s.serializeState(s.game)
+		s.mu.Unlock()
 		writeJSON(w, http.StatusInternalServerError, moveResponse{
 			Success: false,
 			Error:   err.Error(),
-			State:   s.serializeState(s.game),
+			State:   payload,
 		})
 		return
 	}
 
+	s.mu.Lock()
 	payload := s.serializeState(s.game)
+	checkmate := payload.Checkmate
+	check := payload.Check
+	if checkmate {
+		s.flushEngineDataLocked()
+	}
+	s.mu.Unlock()
 	resp := moveResponse{
 		Success: true,
 		State:   payload,
@@ -258,11 +273,10 @@ func (s *Server) handleMove(w http.ResponseWriter, r *http.Request) {
 	if len(responses) > 0 {
 		notes = append(notes, responses...)
 	}
-	if payload.Checkmate {
+	if checkmate {
 		notes = append(notes, "Checkmate")
 		resp.Winner = payload.Winner
-		s.flushEngineDataLocked()
-	} else if payload.Check {
+	} else if check {
 		notes = append(notes, "Check")
 	}
 	if len(notes) > 0 {
@@ -488,30 +502,61 @@ func parsePlayer(value string) (game.Player, bool) {
 	}
 }
 
-func (s *Server) respondWithEnginesLocked() ([]string, error) {
+func (s *Server) respondWithEngines() ([]string, error) {
 	var responses []string
 	for {
+		s.mu.Lock()
 		if s.auto.active {
+			s.mu.Unlock()
 			break
 		}
 		if mate, _ := game.CheckmateStatus(s.game); mate {
+			s.mu.Unlock()
 			break
 		}
 		engine := s.engines[s.game.Turn]
 		if engine == nil {
+			s.mu.Unlock()
 			break
 		}
 		currentPlayer := s.game.Turn
-		mv, err := engine.NextMove(s.game)
+		stateCopy := cloneGameState(s.game)
+		s.mu.Unlock()
+
+		mv, err := engine.NextMove(stateCopy)
 		if err != nil {
 			return responses, errors.New("failed to generate move for " + playerLabel(currentPlayer))
+		}
+
+		s.mu.Lock()
+		if s.auto.active || s.game.Turn != currentPlayer || s.engines[currentPlayer] != engine {
+			s.mu.Unlock()
+			continue
 		}
 		game.ApplyMove(&s.game, mv)
 		s.game.Turn = s.game.Turn.Opponent()
 		s.recordMove(currentPlayer, mv, s.makeBoardPayload(s.game))
+		s.mu.Unlock()
+
 		responses = append(responses, playerLabel(currentPlayer)+": "+game.FormatMove(mv))
 	}
 	return responses, nil
+}
+
+func cloneGameState(state game.GameState) game.GameState {
+	clone := state
+	for idx, hand := range state.Hands {
+		if hand == nil {
+			clone.Hands[idx] = nil
+			continue
+		}
+		copyHand := make(map[game.PieceType]int, len(hand))
+		for pt, count := range hand {
+			copyHand[pt] = count
+		}
+		clone.Hands[idx] = copyHand
+	}
+	return clone
 }
 
 func (s *Server) recordMove(player game.Player, mv game.Move, snapshot boardPayload) {
