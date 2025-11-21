@@ -68,9 +68,11 @@ func New(staticFS http.FileSystem, cfg Config) *Server {
 			game.Bottom: engineHuman,
 			game.Top:    engineRandom,
 		},
-		dataDir:  dataDir,
-		training: newTrainingManager(),
+		dataDir: dataDir,
 	}
+	s.training = newTrainingManager(func(mode string, player game.Player) (game.Engine, error) {
+		return s.buildEngine(mode, player)
+	})
 	s.initial = s.makeBoardPayload(s.game)
 	if err := s.setEngine(game.Top, engineRandom); err != nil {
 		log.Printf("failed to initialize engine: %v", err)
@@ -338,6 +340,7 @@ type trainingRequest struct {
 	EngineTop    string `json:"engine_top"`
 	IntervalMS   int    `json:"interval_ms"`
 	MaxMoves     int    `json:"max_moves"`
+	BatchSize    int    `json:"batch_size"`
 }
 
 type trainingStatePayload struct {
@@ -360,6 +363,7 @@ type trainingConfigPayload struct {
 	TopEngine    string `json:"topEngine"`
 	IntervalMS   int    `json:"intervalMs"`
 	MaxMoves     int    `json:"maxMoves"`
+	BatchSize    int    `json:"batchSize"`
 }
 
 type trainingSummary struct {
@@ -535,6 +539,7 @@ func (s *Server) buildTrainingConfig(req trainingRequest) (trainingConfig, error
 		TopEngine:    strings.TrimSpace(req.EngineTop),
 		IntervalMS:   req.IntervalMS,
 		MaxMoves:     req.MaxMoves,
+		BatchSize:    req.BatchSize,
 	}
 	if cfg.Total <= 0 {
 		return trainingConfig{}, errors.New("games must be greater than zero")
@@ -550,6 +555,9 @@ func (s *Server) buildTrainingConfig(req trainingRequest) (trainingConfig, error
 	}
 	if cfg.MaxMoves <= 0 {
 		cfg.MaxMoves = defaultTrainingMaxMoves
+	}
+	if cfg.BatchSize <= 0 || cfg.BatchSize > cfg.Total {
+		cfg.BatchSize = cfg.Total
 	}
 	if cfg.BottomEngine == "" || cfg.BottomEngine == engineHuman {
 		return trainingConfig{}, errors.New("bottom engine must be an AI engine")
@@ -908,25 +916,116 @@ type trainingConfig struct {
 	Interval     time.Duration
 	IntervalMS   int
 	MaxMoves     int
+	BatchSize    int
 }
 
 type trainingManager struct {
-	mu      sync.Mutex
-	running bool
-	config  trainingConfig
-	summary trainingSummary
-	games   map[int]*trainingGameStatus
-	states  map[int]game.GameState
-	history map[int][]trainingHistoryEntry
-	stopCh  chan struct{}
+	mu          sync.Mutex
+	running     bool
+	config      trainingConfig
+	summary     trainingSummary
+	games       map[int]*trainingGameStatus
+	states      map[int]game.GameState
+	history     map[int][]trainingHistoryEntry
+	stopCh      chan struct{}
+	buildEngine func(mode string, player game.Player) (game.Engine, error)
 }
 
-func newTrainingManager() *trainingManager {
+func newTrainingManager(builder func(mode string, player game.Player) (game.Engine, error)) *trainingManager {
 	return &trainingManager{
-		games:   make(map[int]*trainingGameStatus),
-		states:  make(map[int]game.GameState),
-		history: make(map[int][]trainingHistoryEntry),
+		games:       make(map[int]*trainingGameStatus),
+		states:      make(map[int]game.GameState),
+		history:     make(map[int][]trainingHistoryEntry),
+		buildEngine: builder,
 	}
+}
+
+// trainingEngineFactory creates engines for training games and can keep a shared
+// instance when persistent state should be reused across multiple games.
+type trainingEngineFactory struct {
+	shared  bool
+	engine  game.Engine
+	builder func() (game.Engine, error)
+}
+
+func (f *trainingEngineFactory) initShared() error {
+	if !f.shared {
+		return nil
+	}
+	return f.reload()
+}
+
+func (f *trainingEngineFactory) acquire() (game.Engine, error) {
+	if f.shared {
+		if f.engine == nil {
+			return nil, errors.New("shared engine not initialized")
+		}
+		return f.engine, nil
+	}
+	return f.builder()
+}
+
+func (f *trainingEngineFactory) save() {
+	if f.shared && f.engine != nil {
+		saveEngineData(f.engine)
+	}
+}
+
+func (f *trainingEngineFactory) reload() error {
+	if !f.shared {
+		return nil
+	}
+	eng, err := f.builder()
+	if err != nil {
+		return err
+	}
+	f.engine = eng
+	return nil
+}
+
+// batchEngineSet holds the engine providers for both players within a batch.
+type batchEngineSet struct {
+	bottom *trainingEngineFactory
+	top    *trainingEngineFactory
+}
+
+func (set *batchEngineSet) acquire(player game.Player) (game.Engine, error) {
+	if set == nil {
+		return nil, errors.New("engine set not initialized")
+	}
+	if player == game.Bottom {
+		return set.bottom.acquire()
+	}
+	return set.top.acquire()
+}
+
+func (set *batchEngineSet) save() {
+	if set == nil {
+		return
+	}
+	if set.bottom != nil {
+		set.bottom.save()
+	}
+	if set.top != nil {
+		set.top.save()
+	}
+}
+
+func (set *batchEngineSet) reload() error {
+	if set == nil {
+		return nil
+	}
+	if set.bottom != nil {
+		if err := set.bottom.reload(); err != nil {
+			return err
+		}
+	}
+	if set.top != nil {
+		if err := set.top.reload(); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (tm *trainingManager) Start(cfg trainingConfig) error {
@@ -993,6 +1092,7 @@ func (tm *trainingManager) Snapshot() trainingStatePayload {
 			TopEngine:    tm.config.TopEngine,
 			IntervalMS:   tm.config.IntervalMS,
 			MaxMoves:     tm.config.MaxMoves,
+			BatchSize:    tm.config.BatchSize,
 		}
 	}
 	return payload
@@ -1032,28 +1132,40 @@ func (tm *trainingManager) GameHistory(id int) []trainingHistoryEntry {
 }
 
 func (tm *trainingManager) run(cfg trainingConfig, stop <-chan struct{}) {
-	sem := make(chan struct{}, cfg.Parallel)
-	var wg sync.WaitGroup
-	aborted := false
-launch:
-	for id := 1; id <= cfg.Total; id++ {
-		select {
-		case <-stop:
-			aborted = true
-			break launch
-		default:
-		}
-		sem <- struct{}{}
-		wg.Add(1)
-		go func(gameID int) {
-			defer func() {
-				<-sem
-				wg.Done()
-			}()
-			tm.playSingleGame(gameID, cfg, stop)
-		}(id)
+	engines, err := tm.newBatchEngineSet(cfg)
+	if err != nil {
+		log.Printf("training: failed to initialize engines: %v", err)
+		tm.mu.Lock()
+		tm.summary.Aborted = true
+		tm.stopCh = nil
+		tm.running = false
+		tm.mu.Unlock()
+		return
 	}
-	wg.Wait()
+	remaining := cfg.Total
+	nextID := 1
+	aborted := false
+	for remaining > 0 {
+		batchSize := cfg.BatchSize
+		if batchSize <= 0 || batchSize > remaining {
+			batchSize = remaining
+		}
+		batchAborted := tm.runBatch(cfg, stop, engines, batchSize, &nextID)
+		engines.save()
+		remaining -= batchSize
+		if batchAborted {
+			aborted = true
+			break
+		}
+		if remaining == 0 {
+			break
+		}
+		if err := engines.reload(); err != nil {
+			log.Printf("training: failed to reload engine state: %v", err)
+			aborted = true
+			break
+		}
+	}
 	tm.mu.Lock()
 	if aborted {
 		tm.summary.Aborted = true
@@ -1063,16 +1175,77 @@ launch:
 	tm.mu.Unlock()
 }
 
-func (tm *trainingManager) playSingleGame(id int, cfg trainingConfig, stop <-chan struct{}) {
+func (tm *trainingManager) newBatchEngineSet(cfg trainingConfig) (*batchEngineSet, error) {
+	bottomFactory, err := tm.makeEngineFactory(cfg.BottomEngine, game.Bottom)
+	if err != nil {
+		return nil, err
+	}
+	if err := bottomFactory.initShared(); err != nil {
+		return nil, err
+	}
+	topFactory, err := tm.makeEngineFactory(cfg.TopEngine, game.Top)
+	if err != nil {
+		return nil, err
+	}
+	if err := topFactory.initShared(); err != nil {
+		return nil, err
+	}
+	return &batchEngineSet{bottom: bottomFactory, top: topFactory}, nil
+}
+
+func (tm *trainingManager) makeEngineFactory(mode string, player game.Player) (*trainingEngineFactory, error) {
+	builder := tm.buildEngine
+	usePersistent := builder != nil
+	if builder == nil {
+		builder = func(kind string, _ game.Player) (game.Engine, error) {
+			return newEngineForMode(kind)
+		}
+	}
+	factory := &trainingEngineFactory{
+		shared: mode == engineMCTS && usePersistent,
+	}
+	factory.builder = func() (game.Engine, error) {
+		return builder(mode, player)
+	}
+	return factory, nil
+}
+
+func (tm *trainingManager) runBatch(cfg trainingConfig, stop <-chan struct{}, engines *batchEngineSet, games int, nextID *int) bool {
+	sem := make(chan struct{}, cfg.Parallel)
+	var wg sync.WaitGroup
+	aborted := false
+	for i := 0; i < games; i++ {
+		select {
+		case <-stop:
+			aborted = true
+		default:
+		}
+		id := *nextID
+		*nextID++
+		sem <- struct{}{}
+		wg.Add(1)
+		go func(gameID int) {
+			defer func() {
+				<-sem
+				wg.Done()
+			}()
+			tm.playSingleGame(gameID, cfg, stop, engines)
+		}(id)
+	}
+	wg.Wait()
+	return aborted
+}
+
+func (tm *trainingManager) playSingleGame(id int, cfg trainingConfig, stop <-chan struct{}, engines *batchEngineSet) {
 	tm.registerGame(id)
 	state := game.NewGame()
 	tm.updateGameSnapshot(id, state)
-	bottomEngine, err := newEngineForMode(cfg.BottomEngine)
+	bottomEngine, err := engines.acquire(game.Bottom)
 	if err != nil {
 		tm.recordGameError(id, err)
 		return
 	}
-	topEngine, err := newEngineForMode(cfg.TopEngine)
+	topEngine, err := engines.acquire(game.Top)
 	if err != nil {
 		tm.recordGameError(id, err)
 		return

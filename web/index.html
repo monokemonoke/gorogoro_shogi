@@ -495,6 +495,9 @@
       <label>最大手数
         <input id="training-max-moves" type="number" min="20" value="300" />
       </label>
+      <label>ステート更新間隔（対局数）
+        <input id="training-batch" type="number" min="1" value="32" />
+      </label>
     </div>
     <div class="training-actions">
       <button id="training-start-btn">訓練開始</button>
@@ -596,12 +599,17 @@
       const topEngine = document.getElementById("training-top")?.value || "";
       const interval = parseInt(document.getElementById("training-interval")?.value || "0", 10);
       const maxMoves = parseInt(document.getElementById("training-max-moves")?.value || "0", 10);
+      const batchSize = parseInt(document.getElementById("training-batch")?.value || "0", 10);
       if (!games || games < 1) {
         setTrainingMessage("試合数を1以上にしてください。");
         return;
       }
       if (!parallel || parallel < 1) {
         setTrainingMessage("同時進行数を1以上にしてください。");
+        return;
+      }
+      if (!batchSize || batchSize < 1) {
+        setTrainingMessage("バッチサイズを1以上にしてください。");
         return;
       }
       if (!bottomEngine || bottomEngine === "human" || !topEngine || topEngine === "human") {
@@ -615,7 +623,8 @@
         engine_bottom: bottomEngine,
         engine_top: topEngine,
         interval_ms: Math.max(0, interval),
-        max_moves: Math.max(0, maxMoves)
+        max_moves: Math.max(0, maxMoves),
+        batch_size: Math.max(1, batchSize)
       };
       try {
         const data = await fetchJSON("/api/training", {
@@ -661,7 +670,8 @@
       if (noteEl) {
         if (trainingState?.config?.parallel) {
           const cfg = trainingState.config;
-          noteEl.textContent = `並列 ${cfg.parallel}局 / 最大手数 ${cfg.maxMoves || 0}`;
+          const batch = cfg.batchSize || cfg.total || 0;
+          noteEl.textContent = `並列 ${cfg.parallel}局 / 最大手数 ${cfg.maxMoves || 0} / バッチ ${batch}局`;
         } else {
           noteEl.textContent = "";
         }
