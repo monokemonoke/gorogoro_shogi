@@ -739,6 +739,74 @@ func ApplyMove(state *GameState, move Move) {
 	state.Board[move.To.Y][move.To.X] = fromPiece
 }
 
+type handDelta struct {
+	player Player
+	piece  PieceType
+	delta  int
+}
+
+type moveDiff struct {
+	hasFrom    bool
+	from       Coord
+	fromBefore Piece
+	to         Coord
+	toBefore   Piece
+	handChange handDelta
+	hasHand    bool
+}
+
+// applyMoveInPlace mutates the board and hands directly and returns the diff for undoMove.
+func applyMoveInPlace(state *GameState, move Move, player Player) moveDiff {
+	diff := moveDiff{
+		to:       move.To,
+		toBefore: state.Board[move.To.Y][move.To.X],
+	}
+
+	if move.Drop != nil {
+		diff.handChange = handDelta{player: player, piece: *move.Drop, delta: -1}
+		diff.hasHand = true
+		state.Hands[player][*move.Drop]--
+		state.Board[move.To.Y][move.To.X] = Piece{Kind: *move.Drop, Owner: player, Present: true}
+		return diff
+	}
+
+	if move.From == nil {
+		return diff
+	}
+
+	from := *move.From
+	diff.hasFrom = true
+	diff.from = from
+	diff.fromBefore = state.Board[from.Y][from.X]
+
+	movingPiece := diff.fromBefore
+	state.Board[from.Y][from.X] = Piece{}
+
+	if diff.toBefore.Present {
+		diff.handChange = handDelta{player: player, piece: diff.toBefore.Kind, delta: 1}
+		diff.hasHand = true
+		state.Hands[player][diff.toBefore.Kind]++
+	}
+
+	if move.Promote {
+		movingPiece.Promoted = true
+	}
+	movingPiece.Present = true
+	state.Board[move.To.Y][move.To.X] = movingPiece
+	return diff
+}
+
+func undoMove(state *GameState, diff moveDiff) {
+	state.Board[diff.to.Y][diff.to.X] = diff.toBefore
+	if diff.hasFrom {
+		state.Board[diff.from.Y][diff.from.X] = diff.fromBefore
+	}
+	if diff.hasHand {
+		change := diff.handChange
+		state.Hands[change.player][change.piece] -= change.delta
+	}
+}
+
 func GenerateLegalMoves(state GameState, player Player) []Move {
 	var moves []Move
 	for y := 0; y < BoardRows; y++ {
@@ -774,6 +842,8 @@ func GenerateLegalDrops(state GameState, player Player, pieceKind PieceType) []M
 
 func legalMovesForPiece(state GameState, from Coord, piece Piece) []Move {
 	player := piece.Owner
+	statePtr := &state
+	kingPos, kingFound := findKing(state, player)
 	var moves []Move
 	for _, delta := range movementOffsets(piece) {
 		to := Coord{X: from.X + delta.X, Y: from.Y + delta.Y}
@@ -793,11 +863,12 @@ func legalMovesForPiece(state GameState, from Coord, piece Piece) []Move {
 
 		for _, promote := range promoteOptions {
 			testMove := Move{From: &from, To: to, Promote: promote}
-			testState := CloneState(state)
-			ApplyMove(&testState, testMove)
-			if !InCheck(testState, player) && pieceHasBoardReach(testState.Board[to.Y][to.X], to) {
+			diff := applyMoveInPlace(statePtr, testMove, player)
+			inCheck := playerInCheckAfterAppliedMove(statePtr, player, diff, kingPos, kingFound)
+			if !inCheck && pieceHasBoardReach(statePtr.Board[to.Y][to.X], to) {
 				moves = append(moves, testMove)
 			}
+			undoMove(statePtr, diff)
 		}
 	}
 	return moves
@@ -812,6 +883,8 @@ func legalDropsForPiece(state GameState, player Player, pieceKind PieceType) []M
 		}
 	}
 	var moves []Move
+	statePtr := &state
+	kingPos, kingFound := findKing(state, player)
 	for y := 0; y < BoardRows; y++ {
 		for x := 0; x < BoardCols; x++ {
 			if state.Board[y][x].Present {
@@ -821,11 +894,12 @@ func legalDropsForPiece(state GameState, player Player, pieceKind PieceType) []M
 				continue
 			}
 			testMove := Move{Drop: &pieceKind, To: Coord{X: x, Y: y}}
-			testState := CloneState(state)
-			ApplyMove(&testState, testMove)
-			if !InCheck(testState, player) && pieceHasBoardReach(testState.Board[y][x], testMove.To) {
+			diff := applyMoveInPlace(statePtr, testMove, player)
+			inCheck := playerInCheckAfterAppliedMove(statePtr, player, diff, kingPos, kingFound)
+			if !inCheck && pieceHasBoardReach(statePtr.Board[y][x], testMove.To) {
 				moves = append(moves, testMove)
 			}
+			undoMove(statePtr, diff)
 		}
 	}
 	return moves
@@ -913,16 +987,35 @@ func promotionZoneFor(player Player) (minY, maxY int) {
 	return 0, 1
 }
 
+func playerInCheckAfterAppliedMove(state *GameState, player Player, diff moveDiff, kingPos Coord, kingFound bool) bool {
+	nextKingPos, nextKingFound := kingPositionAfterDiff(player, diff, kingPos, kingFound)
+	if !nextKingFound {
+		return false
+	}
+	return isKingThreatened(&state.Board, player, nextKingPos)
+}
+
+func kingPositionAfterDiff(player Player, diff moveDiff, kingPos Coord, kingFound bool) (Coord, bool) {
+	if diff.hasFrom && diff.fromBefore.Owner == player && diff.fromBefore.Kind == King {
+		return diff.to, true
+	}
+	return kingPos, kingFound
+}
+
 func InCheck(state GameState, player Player) bool {
 	kingPos, found := findKing(state, player)
 	if !found {
 		return false
 	}
+	return isKingThreatened(&state.Board, player, kingPos)
+}
+
+func isKingThreatened(board *[BoardRows][BoardCols]Piece, player Player, kingPos Coord) bool {
 	opponent := player.Opponent()
 
 	for y := 0; y < BoardRows; y++ {
 		for x := 0; x < BoardCols; x++ {
-			p := state.Board[y][x]
+			p := board[y][x]
 			if !p.Present || p.Owner != opponent {
 				continue
 			}
