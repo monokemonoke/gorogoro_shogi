@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -29,6 +30,7 @@ type Server struct {
 		stopCh   chan struct{}
 		interval time.Duration
 	}
+	training *trainingManager
 }
 
 const (
@@ -38,6 +40,7 @@ const (
 	engineMCTS              = "mcts"
 	engineHuman             = "human"
 	defaultAutoInterval     = 1500 * time.Millisecond
+	defaultTrainingMaxMoves = 300
 	defaultDataDir          = "data"
 )
 
@@ -64,7 +67,8 @@ func New(staticFS http.FileSystem, cfg Config) *Server {
 			game.Bottom: engineHuman,
 			game.Top:    engineRandom,
 		},
-		dataDir: dataDir,
+		dataDir:  dataDir,
+		training: newTrainingManager(),
 	}
 	s.initial = s.makeBoardPayload(s.game)
 	if err := s.setEngine(game.Top, engineRandom); err != nil {
@@ -82,6 +86,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/reset", s.handleReset)
 	mux.HandleFunc("/api/engine", s.handleEngine)
 	mux.HandleFunc("/api/auto", s.handleAuto)
+	mux.HandleFunc("/api/training", s.handleTraining)
 	return mux
 }
 
@@ -323,6 +328,53 @@ type autoResponse struct {
 	Running bool `json:"running"`
 }
 
+type trainingRequest struct {
+	Action       string `json:"action"`
+	Games        int    `json:"games"`
+	Parallel     int    `json:"parallel"`
+	EngineBottom string `json:"engine_bottom"`
+	EngineTop    string `json:"engine_top"`
+	IntervalMS   int    `json:"interval_ms"`
+	MaxMoves     int    `json:"max_moves"`
+}
+
+type trainingStatePayload struct {
+	Running bool                  `json:"running"`
+	Config  trainingConfigPayload `json:"config"`
+	Summary trainingSummary       `json:"summary"`
+	Games   []trainingGameStatus  `json:"games"`
+}
+
+type trainingConfigPayload struct {
+	Total        int    `json:"total"`
+	Parallel     int    `json:"parallel"`
+	BottomEngine string `json:"bottomEngine"`
+	TopEngine    string `json:"topEngine"`
+	IntervalMS   int    `json:"intervalMs"`
+	MaxMoves     int    `json:"maxMoves"`
+}
+
+type trainingSummary struct {
+	Total      int  `json:"total"`
+	Completed  int  `json:"completed"`
+	BottomWins int  `json:"bottomWins"`
+	TopWins    int  `json:"topWins"`
+	Draws      int  `json:"draws"`
+	Errors     int  `json:"errors"`
+	Aborted    bool `json:"aborted"`
+}
+
+type trainingGameStatus struct {
+	ID       int    `json:"id"`
+	Moves    int    `json:"moves"`
+	Winner   string `json:"winner,omitempty"`
+	Result   string `json:"result,omitempty"`
+	State    string `json:"state"`
+	LastMove string `json:"lastMove,omitempty"`
+	Turn     string `json:"turn,omitempty"`
+	Error    string `json:"error,omitempty"`
+}
+
 func (s *Server) handleEngine(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -384,6 +436,81 @@ func (s *Server) handleAuto(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, autoResponse{Running: s.auto.active})
+}
+
+func (s *Server) handleTraining(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		writeJSON(w, http.StatusOK, s.training.Snapshot())
+		return
+	case http.MethodPost:
+		var payload trainingRequest
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			http.Error(w, "invalid JSON body", http.StatusBadRequest)
+			return
+		}
+		action := strings.ToLower(strings.TrimSpace(payload.Action))
+		switch action {
+		case "start":
+			cfg, err := s.buildTrainingConfig(payload)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			if err := s.training.Start(cfg); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			writeJSON(w, http.StatusOK, s.training.Snapshot())
+			return
+		case "stop":
+			if err := s.training.Stop(); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			writeJSON(w, http.StatusOK, s.training.Snapshot())
+			return
+		default:
+			http.Error(w, "unknown action for training", http.StatusBadRequest)
+			return
+		}
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+}
+
+func (s *Server) buildTrainingConfig(req trainingRequest) (trainingConfig, error) {
+	cfg := trainingConfig{
+		Total:        req.Games,
+		Parallel:     req.Parallel,
+		BottomEngine: strings.TrimSpace(req.EngineBottom),
+		TopEngine:    strings.TrimSpace(req.EngineTop),
+		IntervalMS:   req.IntervalMS,
+		MaxMoves:     req.MaxMoves,
+	}
+	if cfg.Total <= 0 {
+		return trainingConfig{}, errors.New("games must be greater than zero")
+	}
+	if cfg.Parallel <= 0 {
+		cfg.Parallel = 1
+	}
+	if cfg.Parallel > cfg.Total {
+		cfg.Parallel = cfg.Total
+	}
+	if cfg.IntervalMS > 0 {
+		cfg.Interval = time.Duration(cfg.IntervalMS) * time.Millisecond
+	}
+	if cfg.MaxMoves <= 0 {
+		cfg.MaxMoves = defaultTrainingMaxMoves
+	}
+	if cfg.BottomEngine == "" || cfg.BottomEngine == engineHuman {
+		return trainingConfig{}, errors.New("bottom engine must be an AI engine")
+	}
+	if cfg.TopEngine == "" || cfg.TopEngine == engineHuman {
+		return trainingConfig{}, errors.New("top engine must be an AI engine")
+	}
+	return cfg, nil
 }
 
 func (s *Server) moveFromRequest(state game.GameState, req moveRequest) (game.Move, error) {
@@ -615,23 +742,36 @@ func (s *Server) setEngine(player game.Player, kind string) error {
 		return nil
 	}
 	saveEngineData(s.engines[player])
-	var eng game.Engine
-	switch mode {
-	case engineRandom:
-		eng = game.NewRandomEngine(time.Now().UnixNano())
-	case engineAlphaBeta:
-		eng = game.NewAlphaBetaEngine(3)
-	case engineAlphaBetaMobility:
-		eng = game.NewMobilityAlphaBetaEngine(3)
-	case engineMCTS:
-		path := filepath.Join(s.dataDir, fmt.Sprintf("mcts_%s.json", playerKey(player)))
-		eng = game.NewPersistentMCTSEngine(800, time.Now().UnixNano(), path)
-	default:
-		return errors.New("unknown engine requested")
+	eng, err := s.buildEngine(mode, player)
+	if err != nil {
+		return err
 	}
 	s.engines[player] = eng
 	s.modes[player] = mode
 	return nil
+}
+
+func (s *Server) buildEngine(mode string, player game.Player) (game.Engine, error) {
+	if mode == engineMCTS {
+		path := filepath.Join(s.dataDir, fmt.Sprintf("mcts_%s.json", playerKey(player)))
+		return game.NewPersistentMCTSEngine(800, time.Now().UnixNano(), path), nil
+	}
+	return newEngineForMode(mode)
+}
+
+func newEngineForMode(mode string) (game.Engine, error) {
+	switch mode {
+	case engineRandom:
+		return game.NewRandomEngine(time.Now().UnixNano()), nil
+	case engineAlphaBeta:
+		return game.NewAlphaBetaEngine(3), nil
+	case engineAlphaBetaMobility:
+		return game.NewMobilityAlphaBetaEngine(3), nil
+	case engineMCTS:
+		return game.NewMCTSEngine(800, time.Now().UnixNano()), nil
+	default:
+		return nil, errors.New("unknown engine requested: " + mode)
+	}
 }
 
 func (s *Server) startAutoPlayLocked(interval time.Duration) error {
@@ -708,4 +848,268 @@ func (s *Server) runAutoPlay(stop <-chan struct{}, interval time.Duration) {
 			s.mu.Unlock()
 		}
 	}
+}
+
+type trainingConfig struct {
+	Total        int
+	Parallel     int
+	BottomEngine string
+	TopEngine    string
+	Interval     time.Duration
+	IntervalMS   int
+	MaxMoves     int
+}
+
+type trainingManager struct {
+	mu      sync.Mutex
+	running bool
+	config  trainingConfig
+	summary trainingSummary
+	games   map[int]*trainingGameStatus
+	stopCh  chan struct{}
+}
+
+func newTrainingManager() *trainingManager {
+	return &trainingManager{
+		games: make(map[int]*trainingGameStatus),
+	}
+}
+
+func (tm *trainingManager) Start(cfg trainingConfig) error {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+	if tm.running || tm.stopCh != nil {
+		return errors.New("training already running")
+	}
+	tm.running = true
+	tm.config = cfg
+	tm.summary = trainingSummary{Total: cfg.Total}
+	tm.games = make(map[int]*trainingGameStatus)
+	stop := make(chan struct{})
+	tm.stopCh = stop
+	go tm.run(cfg, stop)
+	return nil
+}
+
+func (tm *trainingManager) Stop() error {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+	if tm.stopCh == nil {
+		return errors.New("training not running")
+	}
+	select {
+	case <-tm.stopCh:
+	default:
+		close(tm.stopCh)
+	}
+	tm.summary.Aborted = true
+	tm.running = false
+	return nil
+}
+
+func (tm *trainingManager) Snapshot() trainingStatePayload {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+	ids := make([]int, 0, len(tm.games))
+	for id := range tm.games {
+		ids = append(ids, id)
+	}
+	sort.Ints(ids)
+	games := make([]trainingGameStatus, 0, len(ids))
+	for _, id := range ids {
+		status := tm.games[id]
+		if status == nil {
+			continue
+		}
+		copyStatus := *status
+		games = append(games, copyStatus)
+	}
+	payload := trainingStatePayload{
+		Running: tm.running,
+		Summary: tm.summary,
+		Games:   games,
+	}
+	if tm.config.Total > 0 {
+		payload.Config = trainingConfigPayload{
+			Total:        tm.config.Total,
+			Parallel:     tm.config.Parallel,
+			BottomEngine: tm.config.BottomEngine,
+			TopEngine:    tm.config.TopEngine,
+			IntervalMS:   tm.config.IntervalMS,
+			MaxMoves:     tm.config.MaxMoves,
+		}
+	}
+	return payload
+}
+
+func (tm *trainingManager) run(cfg trainingConfig, stop <-chan struct{}) {
+	sem := make(chan struct{}, cfg.Parallel)
+	var wg sync.WaitGroup
+	aborted := false
+launch:
+	for id := 1; id <= cfg.Total; id++ {
+		select {
+		case <-stop:
+			aborted = true
+			break launch
+		default:
+		}
+		sem <- struct{}{}
+		wg.Add(1)
+		go func(gameID int) {
+			defer func() {
+				<-sem
+				wg.Done()
+			}()
+			tm.playSingleGame(gameID, cfg, stop)
+		}(id)
+	}
+	wg.Wait()
+	tm.mu.Lock()
+	if aborted {
+		tm.summary.Aborted = true
+	}
+	tm.stopCh = nil
+	tm.running = false
+	tm.mu.Unlock()
+}
+
+func (tm *trainingManager) playSingleGame(id int, cfg trainingConfig, stop <-chan struct{}) {
+	tm.registerGame(id)
+	bottomEngine, err := newEngineForMode(cfg.BottomEngine)
+	if err != nil {
+		tm.recordGameError(id, err)
+		return
+	}
+	topEngine, err := newEngineForMode(cfg.TopEngine)
+	if err != nil {
+		tm.recordGameError(id, err)
+		return
+	}
+	state := game.NewGame()
+	moves := 0
+	lastMove := ""
+	for {
+		select {
+		case <-stop:
+			tm.markGameAborted(id, moves, lastMove)
+			return
+		default:
+		}
+		if mate, winner := game.CheckmateStatus(state); mate {
+			tm.finishGameWin(id, winner, moves, lastMove)
+			return
+		}
+		if cfg.MaxMoves > 0 && moves >= cfg.MaxMoves {
+			tm.finishGameDraw(id, moves, lastMove)
+			return
+		}
+		var eng game.Engine
+		if state.Turn == game.Bottom {
+			eng = bottomEngine
+		} else {
+			eng = topEngine
+		}
+		mv, err := eng.NextMove(state)
+		if err != nil {
+			tm.recordGameError(id, err)
+			return
+		}
+		game.ApplyMove(&state, mv)
+		state.Turn = state.Turn.Opponent()
+		moves++
+		lastMove = game.FormatMove(mv)
+		tm.updateGameProgress(id, moves, lastMove, state.Turn)
+		if cfg.Interval > 0 {
+			select {
+			case <-stop:
+				tm.markGameAborted(id, moves, lastMove)
+				return
+			case <-time.After(cfg.Interval):
+			}
+		}
+	}
+}
+
+func (tm *trainingManager) registerGame(id int) {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+	tm.games[id] = &trainingGameStatus{
+		ID:    id,
+		State: "running",
+		Turn:  playerKey(game.Bottom),
+	}
+}
+
+func (tm *trainingManager) updateGameProgress(id, moves int, lastMove string, next game.Player) {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+	if status, ok := tm.games[id]; ok {
+		status.Moves = moves
+		status.LastMove = lastMove
+		status.Turn = playerKey(next)
+	}
+}
+
+func (tm *trainingManager) finishGameWin(id int, winner game.Player, moves int, lastMove string) {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+	status := tm.ensureStatus(id)
+	status.Moves = moves
+	status.LastMove = lastMove
+	status.Winner = playerKey(winner)
+	status.Result = "win"
+	status.State = "completed"
+	status.Turn = ""
+	tm.summary.Completed++
+	if winner == game.Bottom {
+		tm.summary.BottomWins++
+	} else {
+		tm.summary.TopWins++
+	}
+}
+
+func (tm *trainingManager) finishGameDraw(id, moves int, lastMove string) {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+	status := tm.ensureStatus(id)
+	status.Moves = moves
+	status.LastMove = lastMove
+	status.Result = "draw"
+	status.State = "completed"
+	status.Turn = ""
+	tm.summary.Completed++
+	tm.summary.Draws++
+}
+
+func (tm *trainingManager) recordGameError(id int, err error) {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+	status := tm.ensureStatus(id)
+	status.Result = "error"
+	status.State = "error"
+	status.Error = err.Error()
+	status.Turn = ""
+	tm.summary.Completed++
+	tm.summary.Errors++
+}
+
+func (tm *trainingManager) markGameAborted(id, moves int, lastMove string) {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+	status := tm.ensureStatus(id)
+	status.Moves = moves
+	status.LastMove = lastMove
+	status.Result = "aborted"
+	status.State = "aborted"
+	status.Turn = ""
+}
+
+func (tm *trainingManager) ensureStatus(id int) *trainingGameStatus {
+	status, ok := tm.games[id]
+	if !ok {
+		status = &trainingGameStatus{ID: id}
+		tm.games[id] = status
+	}
+	return status
 }

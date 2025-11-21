@@ -223,6 +223,83 @@
       border-radius: 6px;
       box-shadow: 0 1px 3px rgba(0,0,0,0.2);
     }
+    #training-panel {
+      width: min(100%, 900px);
+      background: #fffaf2;
+      border: 2px solid var(--border);
+      border-radius: 10px;
+      padding: 12px;
+      box-shadow: 0 4px 10px rgba(0,0,0,0.15);
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    #training-panel h2 {
+      margin: 0;
+      font-size: 18px;
+      color: #5e3a12;
+    }
+    .training-form {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+      gap: 10px;
+    }
+    .training-form label {
+      display: flex;
+      flex-direction: column;
+      font-size: 13px;
+      color: #5e3a12;
+      gap: 4px;
+    }
+    .training-form input,
+    .training-form select {
+      padding: 6px 8px;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      background: #fff;
+      font-size: 14px;
+    }
+    .training-actions {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      align-items: center;
+    }
+    #training-summary {
+      font-size: 14px;
+      font-weight: bold;
+      color: #5e3a12;
+      min-height: 18px;
+    }
+    #training-message {
+      min-height: 16px;
+      font-size: 13px;
+      color: #b03a2e;
+    }
+    #training-games-list {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      max-height: 220px;
+      overflow-y: auto;
+    }
+    .training-game-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 6px 8px;
+      border-radius: 6px;
+      border: 1px solid rgba(0,0,0,0.15);
+      background: rgba(255,255,255,0.8);
+      font-size: 13px;
+      gap: 12px;
+    }
+    .training-game-row.running { border-color: #3498db; }
+    .training-game-row.completed { border-color: #2ecc71; }
+    .training-game-row.error { border-color: #e74c3c; }
+    .training-game-row.aborted { border-color: #f39c12; }
+    .training-game-id { font-weight: bold; }
+    .training-config-note { font-size: 12px; color: #6b4a1c; }
   </style>
 </head>
 <body>
@@ -279,6 +356,48 @@
     <button id="refresh-btn">再読込</button>
   </div>
 
+  <section id="training-panel">
+    <h2>エンジン訓練モード</h2>
+    <div class="training-form">
+      <label>試合数
+        <input id="training-games" type="number" min="1" value="20" />
+      </label>
+      <label>同時進行数
+        <input id="training-parallel" type="number" min="1" value="2" />
+      </label>
+      <label>先手エンジン
+        <select id="training-bottom">
+          <option value="random">ランダム</option>
+          <option value="alpha-beta" selected>αβ探索</option>
+          <option value="alpha-beta-mobility">αβ探索(機動性)</option>
+          <option value="mcts">MCTS</option>
+        </select>
+      </label>
+      <label>後手エンジン
+        <select id="training-top">
+          <option value="random" selected>ランダム</option>
+          <option value="alpha-beta">αβ探索</option>
+          <option value="alpha-beta-mobility">αβ探索(機動性)</option>
+          <option value="mcts">MCTS</option>
+        </select>
+      </label>
+      <label>1手ごとの待機(ms)
+        <input id="training-interval" type="number" min="0" value="0" />
+      </label>
+      <label>最大手数
+        <input id="training-max-moves" type="number" min="20" value="300" />
+      </label>
+    </div>
+    <div class="training-actions">
+      <button id="training-start-btn">訓練開始</button>
+      <button id="training-stop-btn" disabled>停止</button>
+      <span class="training-config-note" id="training-config-note"></span>
+    </div>
+    <div id="training-summary"></div>
+    <div id="training-message"></div>
+    <div id="training-games-list"></div>
+  </section>
+
   <script>
     const ROWS = 6;
     const COLS = 5;
@@ -286,6 +405,7 @@
     const OWNER_TOP = "top";
     const AUTO_POLL_MS = 1200;
     const AUTO_INTERVAL_MS = 1500;
+    const TRAINING_POLL_MS = 1500;
 
     let state = null;
     let selected = null; // {type: 'board'|'hand', x,y, kind}
@@ -294,6 +414,8 @@
     let autoPollHandle = null;
     let reviewIndex = 0;
     let followLatest = true;
+    let trainingState = null;
+    let trainingPollHandle = null;
 
     const kindToText = {
       K: "王",
@@ -315,8 +437,197 @@
       document.querySelectorAll("[data-engine-select]").forEach((select) => {
         select.onchange = onEngineChange;
       });
+      initTrainingPanel();
       loadState();
     });
+
+    function initTrainingPanel() {
+      const startBtn = document.getElementById("training-start-btn");
+      const stopBtn = document.getElementById("training-stop-btn");
+      if (startBtn) startBtn.onclick = startTraining;
+      if (stopBtn) stopBtn.onclick = stopTraining;
+      fetchTrainingState();
+    }
+
+    async function fetchTrainingState() {
+      try {
+        const data = await fetchJSON("/api/training");
+        trainingState = data;
+        renderTrainingPanel();
+        setTrainingMessage("");
+        syncTrainingPolling(!!data?.running);
+      } catch (err) {
+        setTrainingMessage(err.message || String(err));
+      }
+    }
+
+    async function startTraining() {
+      const games = parseInt(document.getElementById("training-games")?.value || "0", 10);
+      const parallel = parseInt(document.getElementById("training-parallel")?.value || "0", 10);
+      const bottomEngine = document.getElementById("training-bottom")?.value || "";
+      const topEngine = document.getElementById("training-top")?.value || "";
+      const interval = parseInt(document.getElementById("training-interval")?.value || "0", 10);
+      const maxMoves = parseInt(document.getElementById("training-max-moves")?.value || "0", 10);
+      if (!games || games < 1) {
+        setTrainingMessage("試合数を1以上にしてください。");
+        return;
+      }
+      if (!parallel || parallel < 1) {
+        setTrainingMessage("同時進行数を1以上にしてください。");
+        return;
+      }
+      if (!bottomEngine || bottomEngine === "human" || !topEngine || topEngine === "human") {
+        setTrainingMessage("両方の手番にAIエンジンを設定してください。");
+        return;
+      }
+      const payload = {
+        action: "start",
+        games,
+        parallel,
+        engine_bottom: bottomEngine,
+        engine_top: topEngine,
+        interval_ms: Math.max(0, interval),
+        max_moves: Math.max(0, maxMoves)
+      };
+      try {
+        const data = await fetchJSON("/api/training", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload)
+        });
+        trainingState = data;
+        renderTrainingPanel();
+        setTrainingMessage("訓練を開始しました。");
+        syncTrainingPolling(true);
+      } catch (err) {
+        setTrainingMessage(err.message || String(err));
+      }
+    }
+
+    async function stopTraining() {
+      try {
+        const data = await fetchJSON("/api/training", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ action: "stop" })
+        });
+        trainingState = data;
+        renderTrainingPanel();
+        setTrainingMessage("訓練を停止しました。");
+        syncTrainingPolling(false);
+      } catch (err) {
+        setTrainingMessage(err.message || String(err));
+      }
+    }
+
+    function renderTrainingPanel() {
+      const summaryEl = document.getElementById("training-summary");
+      if (!summaryEl) return;
+      const running = !!trainingState?.running;
+      const summary = trainingState?.summary || {};
+      const startBtn = document.getElementById("training-start-btn");
+      const stopBtn = document.getElementById("training-stop-btn");
+      const noteEl = document.getElementById("training-config-note");
+      if (startBtn) startBtn.disabled = running;
+      if (stopBtn) stopBtn.disabled = !running;
+      if (noteEl) {
+        if (trainingState?.config?.parallel) {
+          const cfg = trainingState.config;
+          noteEl.textContent = `並列 ${cfg.parallel}局 / 最大手数 ${cfg.maxMoves || 0}`;
+        } else {
+          noteEl.textContent = "";
+        }
+      }
+      if (summary.total) {
+        summaryEl.textContent = `進捗 ${summary.completed || 0} / ${summary.total} ｜ 先手勝ち ${summary.bottomWins || 0} ｜ 後手勝ち ${summary.topWins || 0} ｜ 引き分け ${summary.draws || 0}`;
+      } else {
+        summaryEl.textContent = "訓練は未開始です。";
+      }
+      if (summary.aborted && !running) {
+        summaryEl.textContent += "（中断済み）";
+      }
+      renderTrainingGames();
+    }
+
+    function renderTrainingGames() {
+      const listEl = document.getElementById("training-games-list");
+      if (!listEl) return;
+      listEl.innerHTML = "";
+      const games = trainingState?.games || [];
+      if (games.length === 0) {
+        const empty = document.createElement("div");
+        empty.textContent = "進行中の試合はありません。";
+        empty.style.opacity = "0.7";
+        listEl.appendChild(empty);
+        return;
+      }
+      const limit = Math.min(8, games.length);
+      for (let i = 0; i < limit; i++) {
+        const game = games[i];
+        const row = document.createElement("div");
+        row.className = `training-game-row ${game.state || ""}`.trim();
+        const idEl = document.createElement("span");
+        idEl.className = "training-game-id";
+        idEl.textContent = `#${game.id}`;
+        const textEl = document.createElement("span");
+        textEl.textContent = formatTrainingGameText(game);
+        row.appendChild(idEl);
+        row.appendChild(textEl);
+        listEl.appendChild(row);
+      }
+      if (games.length > limit) {
+        const note = document.createElement("div");
+        note.className = "training-config-note";
+        note.textContent = `他 ${games.length - limit} 件`; 
+        listEl.appendChild(note);
+      }
+    }
+
+    function formatTrainingGameText(game) {
+      const stateMap = { running: "進行中", completed: "完了", error: "エラー", aborted: "中断" };
+      const stateLabel = stateMap[game.state] || (game.state || "状態不明");
+      const moves = typeof game.moves === "number" ? game.moves : 0;
+      const parts = [stateLabel, `${moves}手`];
+      if (game.state === "running" && game.turn) {
+        parts.push(`手番: ${labelForOwner(game.turn)}`);
+      }
+      if (game.lastMove) {
+        parts.push(`最終手: ${game.lastMove}`);
+      }
+      if (game.result === "win" && game.winner) {
+        parts.push(`勝者: ${labelForOwner(game.winner)}`);
+      } else if (game.result === "draw") {
+        parts.push("引き分け");
+      } else if (game.result === "error" && game.error) {
+        parts.push(game.error);
+      } else if (game.result === "aborted") {
+        parts.push("中断");
+      }
+      return parts.join(" ｜ ");
+    }
+
+    function setTrainingMessage(msg) {
+      const el = document.getElementById("training-message");
+      if (el) {
+        el.textContent = msg || "";
+      }
+    }
+
+    function syncTrainingPolling(running) {
+      if (running) {
+        if (trainingPollHandle) return;
+        trainingPollHandle = setInterval(fetchTrainingState, TRAINING_POLL_MS);
+      } else if (trainingPollHandle) {
+        clearInterval(trainingPollHandle);
+        trainingPollHandle = null;
+      }
+    }
+
+    function labelForOwner(owner) {
+      if (owner === OWNER_BOTTOM) return "先手";
+      if (owner === OWNER_TOP) return "後手";
+      return owner || "";
+    }
 
     async function loadState() {
       try {
