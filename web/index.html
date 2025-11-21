@@ -691,9 +691,7 @@
         listEl.appendChild(empty);
         return;
       }
-      const limit = Math.min(8, games.length);
-      for (let i = 0; i < limit; i++) {
-        const game = games[i];
+      for (const game of games) {
         const row = document.createElement("div");
         row.className = `training-game-row ${game.state || ""}`.trim();
         if (trainingViewerGameId === game.id) {
@@ -716,12 +714,6 @@
           }
         };
         listEl.appendChild(row);
-      }
-      if (games.length > limit) {
-        const note = document.createElement("div");
-        note.className = "training-config-note";
-        note.textContent = `他 ${games.length - limit} 件`; 
-        listEl.appendChild(note);
       }
     }
 
