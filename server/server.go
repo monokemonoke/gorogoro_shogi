@@ -30,6 +30,7 @@ type Server struct {
 const (
 	engineRandom        = "random"
 	engineAlphaBeta     = "alpha-beta"
+	engineMCTS          = "mcts"
 	engineHuman         = "human"
 	defaultAutoInterval = 1500 * time.Millisecond
 )
@@ -74,12 +75,12 @@ type piecePayload struct {
 }
 
 type boardPayload struct {
-	Board       [][]piecePayload          `json:"board"`
-	Hands       map[string]map[string]int `json:"hands"`
-	Turn        string                    `json:"turn"`
-	Check       bool                      `json:"check"`
-	Checkmate   bool                      `json:"checkmate"`
-	Winner      string                    `json:"winner,omitempty"`
+	Board     [][]piecePayload          `json:"board"`
+	Hands     map[string]map[string]int `json:"hands"`
+	Turn      string                    `json:"turn"`
+	Check     bool                      `json:"check"`
+	Checkmate bool                      `json:"checkmate"`
+	Winner    string                    `json:"winner,omitempty"`
 }
 
 type statePayload struct {
@@ -532,6 +533,8 @@ func (s *Server) setEngine(player game.Player, kind string) error {
 		eng = game.NewRandomEngine(time.Now().UnixNano())
 	case engineAlphaBeta:
 		eng = game.NewAlphaBetaEngine(3)
+	case engineMCTS:
+		eng = game.NewMCTSEngine(800, time.Now().UnixNano())
 	default:
 		return errors.New("unknown engine requested")
 	}
