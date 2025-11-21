@@ -591,10 +591,16 @@ func canPromote(p Piece, destY int) bool {
 	if p.Kind != Silver && p.Kind != Pawn {
 		return false
 	}
-	if p.Owner == Bottom {
-		return destY >= BoardRows-2
+	zoneMin, zoneMax := promotionZoneFor(p.Owner)
+	return destY >= zoneMin && destY <= zoneMax
+}
+
+// promotionZoneFor returns inclusive Y bounds for the opponent's first two ranks.
+func promotionZoneFor(player Player) (minY, maxY int) {
+	if player == Bottom {
+		return BoardRows - 2, BoardRows - 1
 	}
-	return destY <= 1
+	return 0, 1
 }
 
 func InCheck(state GameState, player Player) bool {
