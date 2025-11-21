@@ -436,9 +436,9 @@ func (s *Server) makeBoardPayload(state game.GameState) boardPayload {
 	}
 
 	payload.Check = game.InCheck(state, state.Turn)
-	if game.IsCheckmate(state, state.Turn) {
+	if mate, winner := game.CheckmateStatus(state); mate {
 		payload.Checkmate = true
-		payload.Winner = playerKey(state.Turn.Opponent())
+		payload.Winner = playerKey(winner)
 	}
 	return payload
 }
@@ -474,7 +474,7 @@ func (s *Server) respondWithEnginesLocked() ([]string, error) {
 		if s.auto.active {
 			break
 		}
-		if game.IsCheckmate(s.game, s.game.Turn) {
+		if mate, _ := game.CheckmateStatus(s.game); mate {
 			break
 		}
 		engine := s.engines[s.game.Turn]
@@ -585,7 +585,7 @@ func (s *Server) runAutoPlay(stop <-chan struct{}, interval time.Duration) {
 				s.mu.Unlock()
 				return
 			}
-			if game.IsCheckmate(s.game, s.game.Turn) {
+			if mate, _ := game.CheckmateStatus(s.game); mate {
 				s.auto.active = false
 				s.auto.stopCh = nil
 				s.mu.Unlock()

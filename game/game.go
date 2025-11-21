@@ -953,6 +953,15 @@ func findKing(state GameState, player Player) (Coord, bool) {
 	return Coord{}, false
 }
 
+// CheckmateStatus reports whether the side to move is checkmated and returns the winner if so.
+// The winner value is undefined when the first return value is false.
+func CheckmateStatus(state GameState) (bool, Player) {
+	if !IsCheckmate(state, state.Turn) {
+		return false, Bottom
+	}
+	return true, state.Turn.Opponent()
+}
+
 func IsCheckmate(state GameState, player Player) bool {
 	if !InCheck(state, player) {
 		return false
