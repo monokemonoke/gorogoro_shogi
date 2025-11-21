@@ -293,13 +293,121 @@
       background: rgba(255,255,255,0.8);
       font-size: 13px;
       gap: 12px;
+      cursor: pointer;
+      transition: box-shadow 0.15s ease, border-color 0.15s ease;
     }
     .training-game-row.running { border-color: #3498db; }
     .training-game-row.completed { border-color: #2ecc71; }
     .training-game-row.error { border-color: #e74c3c; }
     .training-game-row.aborted { border-color: #f39c12; }
+    .training-game-row.active {
+      box-shadow: 0 0 0 2px rgba(211,84,0,0.35) inset;
+    }
     .training-game-id { font-weight: bold; }
     .training-config-note { font-size: 12px; color: #6b4a1c; }
+    #training-viewer {
+      border: 1px solid rgba(0,0,0,0.2);
+      border-radius: 8px;
+      padding: 10px;
+      background: #fff7e1;
+    }
+    .training-viewer-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-weight: bold;
+      font-size: 14px;
+      color: #5e3a12;
+    }
+    #training-viewer-status {
+      min-height: 18px;
+      font-size: 13px;
+      color: #6b4a1c;
+    }
+    #training-viewer-body {
+      display: none;
+    }
+    #training-viewer-meta {
+      font-size: 13px;
+      margin: 6px 0;
+      color: #5c4424;
+    }
+    .training-viewer-board-wrapper {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 6px;
+    }
+    #training-viewer-board {
+      display: grid;
+      grid-template-columns: repeat(5, 48px);
+      grid-template-rows: repeat(6, 48px);
+      border: 1px solid #333;
+      background: var(--wood);
+      box-shadow: inset 0 2px 6px rgba(0,0,0,0.2);
+    }
+    #training-viewer-board .cell {
+      width: 48px;
+      height: 48px;
+    }
+    #training-viewer-board .piece {
+      width: 40px;
+      height: 40px;
+      font-size: 20px;
+      cursor: default;
+      box-shadow: none;
+      border-width: 1px;
+    }
+    .training-viewer-hand {
+      width: 100%;
+      min-height: 48px;
+      background: #f4e0ba;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 4px;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 4px;
+      justify-content: center;
+    }
+    .training-viewer-hand .hand-label {
+      margin-bottom: 0;
+      border-bottom: none;
+    }
+    .training-viewer-hand .hand-piece {
+      min-width: 52px;
+      cursor: default;
+    }
+    .training-hand-empty {
+      font-size: 12px;
+      color: #7a6644;
+    }
+    #training-viewer-history {
+      width: 100%;
+      margin-top: 8px;
+      border-top: 1px solid rgba(0,0,0,0.1);
+      padding-top: 6px;
+    }
+    .training-viewer-history-title {
+      font-size: 13px;
+      font-weight: bold;
+      margin-bottom: 4px;
+      color: #5e3a12;
+    }
+    #training-viewer-history-list {
+      max-height: 150px;
+      overflow-y: auto;
+      margin: 0;
+      padding-left: 20px;
+      font-size: 13px;
+    }
+    #training-viewer-history-list li {
+      line-height: 1.4;
+    }
+    .training-history-empty {
+      font-size: 12px;
+      color: #7a6644;
+    }
   </style>
 </head>
 <body>
@@ -396,6 +504,22 @@
     <div id="training-summary"></div>
     <div id="training-message"></div>
     <div id="training-games-list"></div>
+    <div id="training-viewer">
+      <div class="training-viewer-header">
+        <span id="training-viewer-title">訓練試合ビューア</span>
+        <button id="training-viewer-close" type="button">表示クリア</button>
+      </div>
+      <div id="training-viewer-status" class="training-config-note"></div>
+      <div id="training-viewer-body">
+        <div id="training-viewer-meta"></div>
+        <div class="training-viewer-board-wrapper">
+          <div id="training-viewer-top-hand" class="training-viewer-hand"></div>
+          <div id="training-viewer-board"></div>
+          <div id="training-viewer-bottom-hand" class="training-viewer-hand"></div>
+        </div>
+        <div id="training-viewer-history"></div>
+      </div>
+    </div>
   </section>
 
   <script>
@@ -416,6 +540,7 @@
     let followLatest = true;
     let trainingState = null;
     let trainingPollHandle = null;
+    let trainingViewerGameId = null;
 
     const kindToText = {
       K: "王",
@@ -444,8 +569,11 @@
     function initTrainingPanel() {
       const startBtn = document.getElementById("training-start-btn");
       const stopBtn = document.getElementById("training-stop-btn");
+      const closeBtn = document.getElementById("training-viewer-close");
       if (startBtn) startBtn.onclick = startTraining;
       if (stopBtn) stopBtn.onclick = stopTraining;
+      if (closeBtn) closeBtn.onclick = () => clearTrainingViewer();
+      setTrainingViewerPlaceholder("進行中の試合をクリックすると盤面を表示します。");
       fetchTrainingState();
     }
 
@@ -547,6 +675,8 @@
         summaryEl.textContent += "（中断済み）";
       }
       renderTrainingGames();
+      ensureTrainingViewerTargetAvailable();
+      refreshTrainingViewerIfNeeded();
     }
 
     function renderTrainingGames() {
@@ -566,6 +696,9 @@
         const game = games[i];
         const row = document.createElement("div");
         row.className = `training-game-row ${game.state || ""}`.trim();
+        if (trainingViewerGameId === game.id) {
+          row.classList.add("active");
+        }
         const idEl = document.createElement("span");
         idEl.className = "training-game-id";
         idEl.textContent = `#${game.id}`;
@@ -573,6 +706,15 @@
         textEl.textContent = formatTrainingGameText(game);
         row.appendChild(idEl);
         row.appendChild(textEl);
+        row.tabIndex = 0;
+        row.title = "クリックで盤面を表示";
+        row.onclick = () => viewTrainingGame(game.id);
+        row.onkeydown = (e) => {
+          if (e.key === "Enter" || e.key === " ") {
+            e.preventDefault();
+            viewTrainingGame(game.id);
+          }
+        };
         listEl.appendChild(row);
       }
       if (games.length > limit) {
@@ -581,6 +723,194 @@
         note.textContent = `他 ${games.length - limit} 件`; 
         listEl.appendChild(note);
       }
+    }
+
+    function ensureTrainingViewerTargetAvailable() {
+      if (!trainingViewerGameId) return;
+      const games = trainingState?.games || [];
+      const found = games.some((g) => g.id === trainingViewerGameId);
+      if (!found) {
+        clearTrainingViewer("表示中の試合は一覧から外れました。");
+      }
+    }
+
+    function refreshTrainingViewerIfNeeded() {
+      if (!trainingViewerGameId) return;
+      requestTrainingGameDetail(trainingViewerGameId, { silent: true });
+    }
+
+    function viewTrainingGame(gameId) {
+      if (!gameId) return;
+      trainingViewerGameId = gameId;
+      renderTrainingGames();
+      requestTrainingGameDetail(gameId, { silent: false });
+    }
+
+    async function requestTrainingGameDetail(gameId, { silent } = {}) {
+      if (!gameId) return;
+      if (!silent) {
+        setTrainingViewerPlaceholder("盤面を取得しています...");
+      } else {
+        setTrainingViewerStatus("更新中...");
+      }
+      try {
+        const detail = await fetchJSON(`/api/training/game?id=${encodeURIComponent(gameId)}`);
+        if (trainingViewerGameId !== gameId) return;
+        setTrainingViewerStatus("");
+        renderTrainingViewer(detail);
+      } catch (err) {
+        if (trainingViewerGameId !== gameId) return;
+        const msg = err.message || String(err);
+        if (silent) {
+          setTrainingViewerStatus(msg);
+        } else {
+          setTrainingViewerPlaceholder(msg);
+        }
+      }
+    }
+
+    function clearTrainingViewer(message) {
+      trainingViewerGameId = null;
+      setTrainingViewerPlaceholder(message || "進行中の試合をクリックすると盤面を表示します。");
+      renderTrainingGames();
+    }
+
+    function setTrainingViewerPlaceholder(message) {
+      const body = document.getElementById("training-viewer-body");
+      if (body) {
+        body.style.display = "none";
+      }
+      const titleEl = document.getElementById("training-viewer-title");
+      if (titleEl) {
+        titleEl.textContent = "訓練試合ビューア";
+      }
+      setTrainingViewerStatus(message);
+    }
+
+    function setTrainingViewerStatus(message) {
+      const statusEl = document.getElementById("training-viewer-status");
+      if (statusEl) {
+        statusEl.textContent = message || "";
+      }
+    }
+
+    function renderTrainingViewer(detail) {
+      const body = document.getElementById("training-viewer-body");
+      if (!body) return;
+      body.style.display = "block";
+      const titleEl = document.getElementById("training-viewer-title");
+      if (titleEl) {
+        titleEl.textContent = detail?.game ? `試合 #${detail.game.id}` : "訓練試合ビューア";
+      }
+      const metaEl = document.getElementById("training-viewer-meta");
+      if (metaEl) {
+        metaEl.textContent = formatTrainingViewerMeta(detail?.game);
+      }
+      renderTrainingViewerBoard(detail?.snapshot);
+      renderTrainingViewerHand("training-viewer-top-hand", "後手", detail?.snapshot?.hands?.top, OWNER_TOP);
+      renderTrainingViewerHand("training-viewer-bottom-hand", "先手", detail?.snapshot?.hands?.bottom, OWNER_BOTTOM);
+      renderTrainingViewerHistory(detail?.history || []);
+    }
+
+    function formatTrainingViewerMeta(game) {
+      if (!game) return "";
+      const stateMap = { running: "進行中", completed: "完了", error: "エラー", aborted: "中断" };
+      const parts = [`状態: ${stateMap[game.state] || game.state || "不明"}`, `手数: ${game.moves || 0}`];
+      if (game.lastMove) {
+        parts.push(`最終手: ${game.lastMove}`);
+      }
+      if (game.state === "running" && game.turn) {
+        parts.push(`手番: ${labelForOwner(game.turn)}`);
+      }
+      if (game.result === "win" && game.winner) {
+        parts.push(`勝者: ${labelForOwner(game.winner)}`);
+      } else if (game.result === "draw") {
+        parts.push("結果: 引き分け");
+      } else if (game.result === "error" && game.error) {
+        parts.push(`エラー: ${game.error}`);
+      } else if (game.result === "aborted") {
+        parts.push("結果: 中断");
+      }
+      return parts.join(" ｜ ");
+    }
+
+    function renderTrainingViewerBoard(snapshot) {
+      const boardEl = document.getElementById("training-viewer-board");
+      if (!boardEl) return;
+      boardEl.innerHTML = "";
+      for (let displayRow = ROWS - 1; displayRow >= 0; displayRow--) {
+        for (let x = 0; x < COLS; x++) {
+          const cell = document.createElement("div");
+          cell.className = "cell";
+          const row = snapshot?.board?.[displayRow] || [];
+          const piece = row[x];
+          if (piece?.present) {
+            const pieceEl = createPieceElement(piece);
+            pieceEl.draggable = false;
+            cell.appendChild(pieceEl);
+          }
+          boardEl.appendChild(cell);
+        }
+      }
+    }
+
+    function renderTrainingViewerHand(elementId, label, hand, owner) {
+      const handEl = document.getElementById(elementId);
+      if (!handEl) return;
+      handEl.innerHTML = `<div class="hand-label">${label}</div>`;
+      const entries = hand ? Object.entries(hand) : [];
+      if (entries.length === 0) {
+        const empty = document.createElement("div");
+        empty.className = "training-hand-empty";
+        empty.textContent = "なし";
+        handEl.appendChild(empty);
+        return;
+      }
+      const order = ["K", "G", "S", "P"];
+      entries.sort((a, b) => {
+        const ai = order.indexOf(a[0]);
+        const bi = order.indexOf(b[0]);
+        const av = ai === -1 ? 99 : ai;
+        const bv = bi === -1 ? 99 : bi;
+        if (av !== bv) return av - bv;
+        return a[0].localeCompare(b[0]);
+      });
+      entries.forEach(([kind, count]) => {
+        const pieceEl = createPieceElement({ kind, owner, promoted: false });
+        pieceEl.classList.add("hand-piece");
+        pieceEl.draggable = false;
+        const countEl = document.createElement("span");
+        countEl.className = "count";
+        countEl.textContent = `x${count}`;
+        pieceEl.appendChild(countEl);
+        handEl.appendChild(pieceEl);
+      });
+    }
+
+    function renderTrainingViewerHistory(entries) {
+      const container = document.getElementById("training-viewer-history");
+      if (!container) return;
+      container.innerHTML = "";
+      const title = document.createElement("div");
+      title.className = "training-viewer-history-title";
+      title.textContent = "棋譜";
+      container.appendChild(title);
+      if (!entries || entries.length === 0) {
+        const empty = document.createElement("div");
+        empty.className = "training-history-empty";
+        empty.textContent = "まだ着手はありません。";
+        container.appendChild(empty);
+        return;
+      }
+      const list = document.createElement("ol");
+      list.id = "training-viewer-history-list";
+      entries.forEach((entry) => {
+        const item = document.createElement("li");
+        item.textContent = `${labelForOwner(entry.player)} ${entry.move}`;
+        list.appendChild(item);
+      });
+      container.appendChild(list);
+      list.scrollTop = list.scrollHeight;
     }
 
     function formatTrainingGameText(game) {

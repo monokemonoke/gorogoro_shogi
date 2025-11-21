@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -87,6 +88,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/engine", s.handleEngine)
 	mux.HandleFunc("/api/auto", s.handleAuto)
 	mux.HandleFunc("/api/training", s.handleTraining)
+	mux.HandleFunc("/api/training/game", s.handleTrainingGame)
 	return mux
 }
 
@@ -345,6 +347,12 @@ type trainingStatePayload struct {
 	Games   []trainingGameStatus  `json:"games"`
 }
 
+type trainingGameDetailPayload struct {
+	Game     trainingGameStatus     `json:"game"`
+	Snapshot boardPayload           `json:"snapshot"`
+	History  []trainingHistoryEntry `json:"history"`
+}
+
 type trainingConfigPayload struct {
 	Total        int    `json:"total"`
 	Parallel     int    `json:"parallel"`
@@ -373,6 +381,11 @@ type trainingGameStatus struct {
 	LastMove string `json:"lastMove,omitempty"`
 	Turn     string `json:"turn,omitempty"`
 	Error    string `json:"error,omitempty"`
+}
+
+type trainingHistoryEntry struct {
+	Player string `json:"player"`
+	Move   string `json:"move"`
 }
 
 func (s *Server) handleEngine(w http.ResponseWriter, r *http.Request) {
@@ -478,6 +491,40 @@ func (s *Server) handleTraining(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
+}
+
+func (s *Server) handleTrainingGame(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	idStr := strings.TrimSpace(r.URL.Query().Get("id"))
+	if idStr == "" {
+		http.Error(w, "query 'id' is required", http.StatusBadRequest)
+		return
+	}
+	id, err := strconv.Atoi(idStr)
+	if err != nil || id <= 0 {
+		http.Error(w, "invalid training game id", http.StatusBadRequest)
+		return
+	}
+	status, ok := s.training.GameStatus(id)
+	if !ok {
+		http.Error(w, "training game not found", http.StatusNotFound)
+		return
+	}
+	state, ok := s.training.GameState(id)
+	if !ok {
+		http.Error(w, "training game snapshot not available", http.StatusNotFound)
+		return
+	}
+	history := s.training.GameHistory(id)
+	payload := trainingGameDetailPayload{
+		Game:     status,
+		Snapshot: s.makeBoardPayload(state),
+		History:  history,
+	}
+	writeJSON(w, http.StatusOK, payload)
 }
 
 func (s *Server) buildTrainingConfig(req trainingRequest) (trainingConfig, error) {
@@ -869,12 +916,16 @@ type trainingManager struct {
 	config  trainingConfig
 	summary trainingSummary
 	games   map[int]*trainingGameStatus
+	states  map[int]game.GameState
+	history map[int][]trainingHistoryEntry
 	stopCh  chan struct{}
 }
 
 func newTrainingManager() *trainingManager {
 	return &trainingManager{
-		games: make(map[int]*trainingGameStatus),
+		games:   make(map[int]*trainingGameStatus),
+		states:  make(map[int]game.GameState),
+		history: make(map[int][]trainingHistoryEntry),
 	}
 }
 
@@ -888,6 +939,8 @@ func (tm *trainingManager) Start(cfg trainingConfig) error {
 	tm.config = cfg
 	tm.summary = trainingSummary{Total: cfg.Total}
 	tm.games = make(map[int]*trainingGameStatus)
+	tm.states = make(map[int]game.GameState)
+	tm.history = make(map[int][]trainingHistoryEntry)
 	stop := make(chan struct{})
 	tm.stopCh = stop
 	go tm.run(cfg, stop)
@@ -945,6 +998,39 @@ func (tm *trainingManager) Snapshot() trainingStatePayload {
 	return payload
 }
 
+func (tm *trainingManager) GameStatus(id int) (trainingGameStatus, bool) {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+	status, ok := tm.games[id]
+	if !ok || status == nil {
+		return trainingGameStatus{}, false
+	}
+	copyStatus := *status
+	return copyStatus, true
+}
+
+func (tm *trainingManager) GameState(id int) (game.GameState, bool) {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+	state, ok := tm.states[id]
+	if !ok {
+		return game.GameState{}, false
+	}
+	return game.CloneState(state), true
+}
+
+func (tm *trainingManager) GameHistory(id int) []trainingHistoryEntry {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+	entries := tm.history[id]
+	if len(entries) == 0 {
+		return nil
+	}
+	out := make([]trainingHistoryEntry, len(entries))
+	copy(out, entries)
+	return out
+}
+
 func (tm *trainingManager) run(cfg trainingConfig, stop <-chan struct{}) {
 	sem := make(chan struct{}, cfg.Parallel)
 	var wg sync.WaitGroup
@@ -979,6 +1065,8 @@ launch:
 
 func (tm *trainingManager) playSingleGame(id int, cfg trainingConfig, stop <-chan struct{}) {
 	tm.registerGame(id)
+	state := game.NewGame()
+	tm.updateGameSnapshot(id, state)
 	bottomEngine, err := newEngineForMode(cfg.BottomEngine)
 	if err != nil {
 		tm.recordGameError(id, err)
@@ -989,26 +1077,29 @@ func (tm *trainingManager) playSingleGame(id int, cfg trainingConfig, stop <-cha
 		tm.recordGameError(id, err)
 		return
 	}
-	state := game.NewGame()
 	moves := 0
 	lastMove := ""
 	for {
 		select {
 		case <-stop:
+			tm.updateGameSnapshot(id, state)
 			tm.markGameAborted(id, moves, lastMove)
 			return
 		default:
 		}
 		if mate, winner := game.CheckmateStatus(state); mate {
+			tm.updateGameSnapshot(id, state)
 			tm.finishGameWin(id, winner, moves, lastMove)
 			return
 		}
 		if cfg.MaxMoves > 0 && moves >= cfg.MaxMoves {
+			tm.updateGameSnapshot(id, state)
 			tm.finishGameDraw(id, moves, lastMove)
 			return
 		}
 		var eng game.Engine
-		if state.Turn == game.Bottom {
+		currentPlayer := state.Turn
+		if currentPlayer == game.Bottom {
 			eng = bottomEngine
 		} else {
 			eng = topEngine
@@ -1022,10 +1113,13 @@ func (tm *trainingManager) playSingleGame(id int, cfg trainingConfig, stop <-cha
 		state.Turn = state.Turn.Opponent()
 		moves++
 		lastMove = game.FormatMove(mv)
+		tm.appendHistory(id, currentPlayer, lastMove)
+		tm.updateGameSnapshot(id, state)
 		tm.updateGameProgress(id, moves, lastMove, state.Turn)
 		if cfg.Interval > 0 {
 			select {
 			case <-stop:
+				tm.updateGameSnapshot(id, state)
 				tm.markGameAborted(id, moves, lastMove)
 				return
 			case <-time.After(cfg.Interval):
@@ -1042,6 +1136,23 @@ func (tm *trainingManager) registerGame(id int) {
 		State: "running",
 		Turn:  playerKey(game.Bottom),
 	}
+	tm.history[id] = nil
+}
+
+func (tm *trainingManager) updateGameSnapshot(id int, state game.GameState) {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+	tm.states[id] = game.CloneState(state)
+}
+
+func (tm *trainingManager) appendHistory(id int, player game.Player, move string) {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+	entry := trainingHistoryEntry{
+		Player: playerKey(player),
+		Move:   move,
+	}
+	tm.history[id] = append(tm.history[id], entry)
 }
 
 func (tm *trainingManager) updateGameProgress(id, moves int, lastMove string, next game.Player) {
