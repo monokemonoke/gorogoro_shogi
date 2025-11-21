@@ -66,32 +66,32 @@ func (e *MCTSEngine) SaveIfNeeded() error {
 }
 
 func (e *MCTSEngine) NextMove(state GameState) (Move, error) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-
 	legal := GenerateLegalMoves(state, state.Turn)
 	if len(legal) == 0 {
 		return Move{}, errors.New("no legal moves to play")
 	}
-	root := newMCTSNode(CloneState(state), nil, nil)
-	e.applyPriorKnowledge(root)
+	rootState := CloneState(state)
+	root := newMCTSNode(rootState, nil, nil)
+	stateKey, prior := e.snapshotKnowledge(rootState)
+	applyPriorKnowledge(root, prior)
 	rootPlayer := state.Turn
+	rng := e.newWorkerRNG()
 	for i := 0; i < e.iterations; i++ {
 		node := root
 		for len(node.untried) == 0 && len(node.children) > 0 {
 			node = node.selectChild(e.exploration)
 		}
 		if len(node.untried) > 0 {
-			node = node.expand(e.rng)
+			node = node.expand(rng)
 		}
-		winner, decided := e.rollout(node.state, rootPlayer)
+		winner, decided := e.rollout(node.state, rootPlayer, rng)
 		node.backpropagate(winner, rootPlayer, decided)
 	}
 	best := root.bestChildByVisits()
 	if best == nil || best.move == nil {
 		return Move{}, errors.New("failed to choose move")
 	}
-	e.updateKnowledgeFromRoot(root)
+	e.updateKnowledgeFromRoot(root, stateKey)
 	return *best.move, nil
 }
 
@@ -187,7 +187,7 @@ func (n *mctsNode) backpropagate(winner Player, root Player, decided bool) {
 	}
 }
 
-func (e *MCTSEngine) rollout(state GameState, root Player) (Player, bool) {
+func (e *MCTSEngine) rollout(state GameState, root Player, rng *rand.Rand) (Player, bool) {
 	sim := CloneState(state)
 	for depth := 0; depth < mctsRolloutDepth; depth++ {
 		moves := GenerateLegalMoves(sim, sim.Turn)
@@ -197,7 +197,7 @@ func (e *MCTSEngine) rollout(state GameState, root Player) (Player, bool) {
 			}
 			return root, false
 		}
-		mv := moves[e.rng.Intn(len(moves))]
+		mv := moves[rng.Intn(len(moves))]
 		ApplyMove(&sim, mv)
 		sim.Turn = sim.Turn.Opponent()
 	}
@@ -212,13 +212,33 @@ func (e *MCTSEngine) rollout(state GameState, root Player) (Player, bool) {
 	}
 }
 
-func (e *MCTSEngine) applyPriorKnowledge(root *mctsNode) {
+func (e *MCTSEngine) newWorkerRNG() *rand.Rand {
+	e.mu.Lock()
+	seed := e.rng.Int63()
+	e.mu.Unlock()
+	return rand.New(rand.NewSource(seed))
+}
+
+func (e *MCTSEngine) snapshotKnowledge(state GameState) (string, map[string]moveStats) {
 	if e.storagePath == "" {
-		return
+		return "", nil
 	}
-	key := encodeStateKey(root.state)
-	entries, ok := e.knowledge[key]
-	if !ok || len(entries) == 0 {
+	key := encodeStateKey(state)
+	e.mu.Lock()
+	entries := e.knowledge[key]
+	var clone map[string]moveStats
+	if len(entries) > 0 {
+		clone = make(map[string]moveStats, len(entries))
+		for mv, stats := range entries {
+			clone[mv] = stats
+		}
+	}
+	e.mu.Unlock()
+	return key, clone
+}
+
+func applyPriorKnowledge(root *mctsNode, entries map[string]moveStats) {
+	if len(entries) == 0 {
 		return
 	}
 	var remaining []Move
@@ -240,11 +260,13 @@ func (e *MCTSEngine) applyPriorKnowledge(root *mctsNode) {
 	root.untried = remaining
 }
 
-func (e *MCTSEngine) updateKnowledgeFromRoot(root *mctsNode) {
+func (e *MCTSEngine) updateKnowledgeFromRoot(root *mctsNode, key string) {
 	if e.storagePath == "" {
 		return
 	}
-	key := encodeStateKey(root.state)
+	if key == "" {
+		key = encodeStateKey(root.state)
+	}
 	entries := make(map[string]moveStats)
 	for _, child := range root.children {
 		if child.move == nil {
@@ -255,8 +277,10 @@ func (e *MCTSEngine) updateKnowledgeFromRoot(root *mctsNode) {
 			Wins:   child.wins,
 		}
 	}
+	e.mu.Lock()
 	e.knowledge[key] = entries
 	e.dirty = true
+	e.mu.Unlock()
 }
 
 func (e *MCTSEngine) loadKnowledge() error {
