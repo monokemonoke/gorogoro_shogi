@@ -6,16 +6,49 @@ import (
 	"strings"
 )
 
-// AlphaBetaEngine performs a depth-limited minimax search with alpha-beta pruning.
+// AlphaBetaEngine performs a depth-limited minimax search with material-only evaluation.
 type AlphaBetaEngine struct {
-	Depth int
-	table map[stateKey]ttEntry
+	search *alphaBetaSearch
 }
 
 func NewAlphaBetaEngine(depth int) *AlphaBetaEngine {
 	return &AlphaBetaEngine{
-		Depth: depth,
-		table: make(map[stateKey]ttEntry),
+		search: newAlphaBetaSearch(depth, materialEvaluation),
+	}
+}
+
+func (e *AlphaBetaEngine) NextMove(state GameState) (Move, error) {
+	return e.search.nextMove(state)
+}
+
+// MobilityAlphaBetaEngine adds a mobility-aware evaluation on top of alpha-beta search.
+type MobilityAlphaBetaEngine struct {
+	search *alphaBetaSearch
+}
+
+func NewMobilityAlphaBetaEngine(depth int) *MobilityAlphaBetaEngine {
+	return &MobilityAlphaBetaEngine{
+		search: newAlphaBetaSearch(depth, mobilityEvaluation),
+	}
+}
+
+func (e *MobilityAlphaBetaEngine) NextMove(state GameState) (Move, error) {
+	return e.search.nextMove(state)
+}
+
+type evaluationFunc func(GameState, Player, int) int
+
+type alphaBetaSearch struct {
+	depth    int
+	table    map[stateKey]ttEntry
+	evaluate evaluationFunc
+}
+
+func newAlphaBetaSearch(depth int, evaluate evaluationFunc) *alphaBetaSearch {
+	return &alphaBetaSearch{
+		depth:    depth,
+		table:    make(map[stateKey]ttEntry),
+		evaluate: evaluate,
 	}
 }
 
@@ -46,25 +79,25 @@ const (
 	infiniteScore  = 1_000_000_000
 )
 
-func (e *AlphaBetaEngine) NextMove(state GameState) (Move, error) {
+func (s *alphaBetaSearch) nextMove(state GameState) (Move, error) {
 	moves := GenerateLegalMoves(state, state.Turn)
 	if len(moves) == 0 {
 		return Move{}, errors.New("no legal moves to play")
 	}
-	if e.table == nil {
-		e.table = make(map[stateKey]ttEntry)
+	if s.table == nil {
+		s.table = make(map[stateKey]ttEntry)
 	}
-	_, best := e.search(state, e.Depth, -infiniteScore, infiniteScore, state.Turn)
+	_, best := s.search(state, s.depth, -infiniteScore, infiniteScore, state.Turn)
 	if best == nil {
 		return Move{}, errors.New("failed to find a move")
 	}
 	return *best, nil
 }
 
-func (e *AlphaBetaEngine) search(state GameState, depth int, alpha, beta int, maximizer Player) (int, *Move) {
+func (s *alphaBetaSearch) search(state GameState, depth int, alpha, beta int, maximizer Player) (int, *Move) {
 	alphaOrig, betaOrig := alpha, beta
 	key := makeStateKey(state, maximizer)
-	if entry, ok := e.table[key]; ok && entry.depth >= depth {
+	if entry, ok := s.table[key]; ok && entry.depth >= depth {
 		switch entry.bound {
 		case boundExact:
 			return entry.score, duplicateEntryMove(entry)
@@ -83,15 +116,15 @@ func (e *AlphaBetaEngine) search(state GameState, depth int, alpha, beta int, ma
 	}
 
 	if depth == 0 {
-		score := e.evaluate(state, maximizer, depth)
-		e.table[key] = ttEntry{depth: depth, score: score, bound: boundExact}
+		score := s.evaluate(state, maximizer, depth)
+		s.table[key] = ttEntry{depth: depth, score: score, bound: boundExact}
 		return score, nil
 	}
 
 	legal := GenerateLegalMoves(state, state.Turn)
 	if len(legal) == 0 {
-		score := e.evaluate(state, maximizer, depth)
-		e.table[key] = ttEntry{depth: depth, score: score, bound: boundExact}
+		score := s.evaluate(state, maximizer, depth)
+		s.table[key] = ttEntry{depth: depth, score: score, bound: boundExact}
 		return score, nil
 	}
 
@@ -103,7 +136,7 @@ func (e *AlphaBetaEngine) search(state GameState, depth int, alpha, beta int, ma
 			ApplyMove(&next, mv)
 			next.Turn = next.Turn.Opponent()
 
-			score, _ := e.search(next, depth-1, alpha, beta, maximizer)
+			score, _ := s.search(next, depth-1, alpha, beta, maximizer)
 			if score > bestScore {
 				bestScore = score
 				mvCopy := mv
@@ -117,7 +150,7 @@ func (e *AlphaBetaEngine) search(state GameState, depth int, alpha, beta int, ma
 			}
 		}
 		bound := determineBound(bestScore, alphaOrig, betaOrig)
-		e.table[key] = makeEntry(bestScore, depth, bound, chosen)
+		s.table[key] = makeEntry(bestScore, depth, bound, chosen)
 		return bestScore, chosen
 	}
 
@@ -127,7 +160,7 @@ func (e *AlphaBetaEngine) search(state GameState, depth int, alpha, beta int, ma
 		ApplyMove(&next, mv)
 		next.Turn = next.Turn.Opponent()
 
-		score, _ := e.search(next, depth-1, alpha, beta, maximizer)
+		score, _ := s.search(next, depth-1, alpha, beta, maximizer)
 		if score < bestScore {
 			bestScore = score
 			mvCopy := mv
@@ -141,7 +174,7 @@ func (e *AlphaBetaEngine) search(state GameState, depth int, alpha, beta int, ma
 		}
 	}
 	bound := determineBound(bestScore, alphaOrig, betaOrig)
-	e.table[key] = makeEntry(bestScore, depth, bound, chosen)
+	s.table[key] = makeEntry(bestScore, depth, bound, chosen)
 	return bestScore, chosen
 }
 
@@ -213,7 +246,9 @@ func encodeState(state GameState) string {
 	return b.String()
 }
 
-func (e *AlphaBetaEngine) evaluate(state GameState, maximizer Player, depth int) int {
+const mobilityWeight = 2
+
+func materialEvaluation(state GameState, maximizer Player, depth int) int {
 	if IsCheckmate(state, maximizer) {
 		return -checkmateScore - depth
 	}
@@ -221,34 +256,20 @@ func (e *AlphaBetaEngine) evaluate(state GameState, maximizer Player, depth int)
 		return checkmateScore + depth
 	}
 
-	score := 0
-	for y := 0; y < BoardRows; y++ {
-		for x := 0; x < BoardCols; x++ {
-			p := state.Board[y][x]
-			if !p.Present {
-				continue
-			}
-			value := pieceValue(p)
-			if p.Owner == maximizer {
-				score += value
-			} else {
-				score -= value
-			}
-		}
-	}
-
-	for pType, count := range state.Hands[maximizer] {
-		score += pieceScores[pType] * count
-	}
-	for pType, count := range state.Hands[maximizer.Opponent()] {
-		score -= pieceScores[pType] * count
-	}
-
+	score := materialBalance(state, maximizer)
 	if InCheck(state, maximizer) {
 		score -= 5
 	}
 	if InCheck(state, maximizer.Opponent()) {
 		score += 5
 	}
+	return score
+}
+
+func mobilityEvaluation(state GameState, maximizer Player, depth int) int {
+	score := materialEvaluation(state, maximizer, depth)
+	myMoves := len(GenerateLegalMoves(state, maximizer))
+	opponentMoves := len(GenerateLegalMoves(state, maximizer.Opponent()))
+	score += mobilityWeight * (myMoves - opponentMoves)
 	return score
 }

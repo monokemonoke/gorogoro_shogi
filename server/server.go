@@ -28,11 +28,12 @@ type Server struct {
 }
 
 const (
-	engineRandom        = "random"
-	engineAlphaBeta     = "alpha-beta"
-	engineMCTS          = "mcts"
-	engineHuman         = "human"
-	defaultAutoInterval = 1500 * time.Millisecond
+	engineRandom            = "random"
+	engineAlphaBeta         = "alpha-beta"
+	engineAlphaBetaMobility = "alpha-beta-mobility"
+	engineMCTS              = "mcts"
+	engineHuman             = "human"
+	defaultAutoInterval     = 1500 * time.Millisecond
 )
 
 func New(staticFS http.FileSystem) *Server {
@@ -533,6 +534,8 @@ func (s *Server) setEngine(player game.Player, kind string) error {
 		eng = game.NewRandomEngine(time.Now().UnixNano())
 	case engineAlphaBeta:
 		eng = game.NewAlphaBetaEngine(3)
+	case engineAlphaBetaMobility:
+		eng = game.NewMobilityAlphaBetaEngine(3)
 	case engineMCTS:
 		eng = game.NewMCTSEngine(800, time.Now().UnixNano())
 	default:
