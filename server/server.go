@@ -16,22 +16,39 @@ type Server struct {
 	mu      sync.Mutex
 	game    game.GameState
 	history []historyEntry
+	initial boardPayload
 	static  http.Handler
-	engine  game.Engine
-	mode    string
+	engines map[game.Player]game.Engine
+	modes   map[game.Player]string
+	auto    struct {
+		active   bool
+		stopCh   chan struct{}
+		interval time.Duration
+	}
 }
 
 const (
-	engineRandom    = "random"
-	engineAlphaBeta = "alpha-beta"
+	engineRandom        = "random"
+	engineAlphaBeta     = "alpha-beta"
+	engineHuman         = "human"
+	defaultAutoInterval = 1500 * time.Millisecond
 )
 
 func New(staticFS http.FileSystem) *Server {
 	s := &Server{
 		game:   game.NewGame(),
 		static: http.FileServer(staticFS),
+		engines: map[game.Player]game.Engine{
+			game.Bottom: nil,
+			game.Top:    nil,
+		},
+		modes: map[game.Player]string{
+			game.Bottom: engineHuman,
+			game.Top:    engineRandom,
+		},
 	}
-	if err := s.setEngine(engineRandom); err != nil {
+	s.initial = s.makeBoardPayload(s.game)
+	if err := s.setEngine(game.Top, engineRandom); err != nil {
 		log.Printf("failed to initialize engine: %v", err)
 	}
 	return s
@@ -45,6 +62,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/move", s.handleMove)
 	mux.HandleFunc("/api/reset", s.handleReset)
 	mux.HandleFunc("/api/engine", s.handleEngine)
+	mux.HandleFunc("/api/auto", s.handleAuto)
 	return mux
 }
 
@@ -55,20 +73,28 @@ type piecePayload struct {
 	Present  bool   `json:"present"`
 }
 
+type boardPayload struct {
+	Board       [][]piecePayload          `json:"board"`
+	Hands       map[string]map[string]int `json:"hands"`
+	Turn        string                    `json:"turn"`
+	Check       bool                      `json:"check"`
+	Checkmate   bool                      `json:"checkmate"`
+	Winner      string                    `json:"winner,omitempty"`
+}
+
 type statePayload struct {
-	Board     [][]piecePayload          `json:"board"`
-	Hands     map[string]map[string]int `json:"hands"`
-	Turn      string                    `json:"turn"`
-	Check     bool                      `json:"check"`
-	Checkmate bool                      `json:"checkmate"`
-	Winner    string                    `json:"winner,omitempty"`
-	Engine    string                    `json:"engine"`
-	History   []historyEntry            `json:"history"`
+	boardPayload
+	Engine      string            `json:"engine"`
+	Engines     map[string]string `json:"engines"`
+	AutoPlaying bool              `json:"autoPlaying"`
+	History     []historyEntry    `json:"history"`
+	Initial     boardPayload      `json:"initial"`
 }
 
 type historyEntry struct {
-	Player string `json:"player"`
-	Move   string `json:"move"`
+	Player   string       `json:"player"`
+	Move     string       `json:"move"`
+	Snapshot boardPayload `json:"snapshot"`
 }
 
 type moveRequest struct {
@@ -158,6 +184,16 @@ func (s *Server) handleMove(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.mu.Lock()
+	if s.auto.active {
+		payload := s.serializeState(s.game)
+		s.mu.Unlock()
+		writeJSON(w, http.StatusConflict, moveResponse{
+			Success: false,
+			Error:   "auto play is running",
+			State:   payload,
+		})
+		return
+	}
 	defer s.mu.Unlock()
 
 	mv, err := s.moveFromRequest(s.game, req)
@@ -182,9 +218,9 @@ func (s *Server) handleMove(w http.ResponseWriter, r *http.Request) {
 
 	movingPlayer := s.game.Turn
 	s.game = applied
-	s.recordMove(movingPlayer, mv)
 	s.game.Turn = s.game.Turn.Opponent()
-	aiMessage, err := s.respondAsGoteIfNeeded()
+	s.recordMove(movingPlayer, mv, s.makeBoardPayload(s.game))
+	responses, err := s.respondWithEnginesLocked()
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, moveResponse{
 			Success: false,
@@ -200,8 +236,8 @@ func (s *Server) handleMove(w http.ResponseWriter, r *http.Request) {
 		State:   payload,
 	}
 	var notes []string
-	if aiMessage != "" {
-		notes = append(notes, aiMessage)
+	if len(responses) > 0 {
+		notes = append(notes, responses...)
 	}
 	if payload.Checkmate {
 		notes = append(notes, "Checkmate")
@@ -223,8 +259,10 @@ func (s *Server) handleReset(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.mu.Lock()
+	s.stopAutoPlayLocked()
 	s.game = game.NewGame()
 	s.history = nil
+	s.initial = s.makeBoardPayload(s.game)
 	payload := s.serializeState(s.game)
 	s.mu.Unlock()
 
@@ -232,11 +270,22 @@ func (s *Server) handleReset(w http.ResponseWriter, r *http.Request) {
 }
 
 type engineResponse struct {
-	Engine string `json:"engine"`
+	Engine  string            `json:"engine"`
+	Engines map[string]string `json:"engines"`
 }
 
 type engineRequest struct {
+	Player string `json:"player"`
 	Engine string `json:"engine"`
+}
+
+type autoRequest struct {
+	Running    bool `json:"running"`
+	IntervalMS int  `json:"interval_ms"`
+}
+
+type autoResponse struct {
+	Running bool `json:"running"`
 }
 
 func (s *Server) handleEngine(w http.ResponseWriter, r *http.Request) {
@@ -245,7 +294,7 @@ func (s *Server) handleEngine(w http.ResponseWriter, r *http.Request) {
 
 	switch r.Method {
 	case http.MethodGet:
-		writeJSON(w, http.StatusOK, engineResponse{Engine: s.mode})
+		writeJSON(w, http.StatusOK, s.engineStatus())
 		return
 	case http.MethodPost:
 		var payload engineRequest
@@ -253,16 +302,53 @@ func (s *Server) handleEngine(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "invalid JSON body", http.StatusBadRequest)
 			return
 		}
-		if err := s.setEngine(payload.Engine); err != nil {
+		player := game.Top
+		if payload.Player != "" {
+			mapped, ok := parsePlayer(payload.Player)
+			if !ok {
+				http.Error(w, "unknown player for engine", http.StatusBadRequest)
+				return
+			}
+			player = mapped
+		}
+		if err := s.setEngine(player, payload.Engine); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		writeJSON(w, http.StatusOK, engineResponse{Engine: s.mode})
+		writeJSON(w, http.StatusOK, s.engineStatus())
 		return
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
+}
+
+func (s *Server) handleAuto(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+
+	var payload autoRequest
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		http.Error(w, "invalid JSON body", http.StatusBadRequest)
+		return
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if payload.Running {
+		interval := time.Duration(payload.IntervalMS) * time.Millisecond
+		if err := s.startAutoPlayLocked(interval); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+	} else {
+		s.stopAutoPlayLocked()
+	}
+
+	writeJSON(w, http.StatusOK, autoResponse{Running: s.auto.active})
 }
 
 func (s *Server) moveFromRequest(state game.GameState, req moveRequest) (game.Move, error) {
@@ -301,15 +387,24 @@ func (s *Server) moveFromRequest(state game.GameState, req moveRequest) (game.Mo
 }
 
 func (s *Server) serializeState(state game.GameState) statePayload {
-	payload := statePayload{
+	return statePayload{
+		boardPayload: s.makeBoardPayload(state),
+		Engine:       s.modes[game.Top],
+		Engines:      map[string]string{"bottom": s.modes[game.Bottom], "top": s.modes[game.Top]},
+		AutoPlaying:  s.auto.active,
+		History:      append([]historyEntry(nil), s.history...),
+		Initial:      s.initial,
+	}
+}
+
+func (s *Server) makeBoardPayload(state game.GameState) boardPayload {
+	payload := boardPayload{
 		Board: make([][]piecePayload, game.BoardRows),
 		Hands: map[string]map[string]int{
 			"bottom": {},
 			"top":    {},
 		},
-		Turn:    playerKey(state.Turn),
-		Engine:  s.mode,
-		History: append([]historyEntry(nil), s.history...),
+		Turn: playerKey(state.Turn),
 	}
 
 	for y := 0; y < game.BoardRows; y++ {
@@ -354,31 +449,55 @@ func playerKey(p game.Player) string {
 	return "top"
 }
 
-func (s *Server) respondAsGoteIfNeeded() (string, error) {
-	if s.engine == nil {
-		return "", nil
+func playerLabel(p game.Player) string {
+	if p == game.Bottom {
+		return "先手"
 	}
-	if s.game.Turn != game.Top {
-		return "", nil
-	}
-	if game.IsCheckmate(s.game, s.game.Turn) {
-		return "", nil
-	}
-	currentPlayer := s.game.Turn
-	mv, err := s.engine.NextMove(s.game)
-	if err != nil {
-		return "", errors.New("failed to generate move for gote")
-	}
-	game.ApplyMove(&s.game, mv)
-	s.recordMove(currentPlayer, mv)
-	s.game.Turn = s.game.Turn.Opponent()
-	return "後手: " + game.FormatMove(mv), nil
+	return "後手"
 }
 
-func (s *Server) recordMove(player game.Player, mv game.Move) {
+func parsePlayer(value string) (game.Player, bool) {
+	switch strings.ToLower(value) {
+	case "", "top":
+		return game.Top, true
+	case "bottom":
+		return game.Bottom, true
+	default:
+		return game.Bottom, false
+	}
+}
+
+func (s *Server) respondWithEnginesLocked() ([]string, error) {
+	var responses []string
+	for {
+		if s.auto.active {
+			break
+		}
+		if game.IsCheckmate(s.game, s.game.Turn) {
+			break
+		}
+		engine := s.engines[s.game.Turn]
+		if engine == nil {
+			break
+		}
+		currentPlayer := s.game.Turn
+		mv, err := engine.NextMove(s.game)
+		if err != nil {
+			return responses, errors.New("failed to generate move for " + playerLabel(currentPlayer))
+		}
+		game.ApplyMove(&s.game, mv)
+		s.game.Turn = s.game.Turn.Opponent()
+		s.recordMove(currentPlayer, mv, s.makeBoardPayload(s.game))
+		responses = append(responses, playerLabel(currentPlayer)+": "+game.FormatMove(mv))
+	}
+	return responses, nil
+}
+
+func (s *Server) recordMove(player game.Player, mv game.Move, snapshot boardPayload) {
 	s.history = append(s.history, historyEntry{
-		Player: playerKey(player),
-		Move:   game.FormatMove(mv),
+		Player:   playerKey(player),
+		Move:     game.FormatMove(mv),
+		Snapshot: snapshot,
 	})
 }
 
@@ -390,15 +509,105 @@ func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 	}
 }
 
-func (s *Server) setEngine(kind string) error {
-	switch kind {
+func (s *Server) engineStatus() engineResponse {
+	return engineResponse{
+		Engine: s.modes[game.Top],
+		Engines: map[string]string{
+			"bottom": s.modes[game.Bottom],
+			"top":    s.modes[game.Top],
+		},
+	}
+}
+
+func (s *Server) setEngine(player game.Player, kind string) error {
+	mode := strings.TrimSpace(kind)
+	if mode == "" || mode == engineHuman {
+		s.engines[player] = nil
+		s.modes[player] = engineHuman
+		return nil
+	}
+	var eng game.Engine
+	switch mode {
 	case engineRandom:
-		s.engine = game.NewRandomEngine(time.Now().UnixNano())
+		eng = game.NewRandomEngine(time.Now().UnixNano())
 	case engineAlphaBeta:
-		s.engine = game.NewAlphaBetaEngine(3)
+		eng = game.NewAlphaBetaEngine(3)
 	default:
 		return errors.New("unknown engine requested")
 	}
-	s.mode = kind
+	s.engines[player] = eng
+	s.modes[player] = mode
 	return nil
+}
+
+func (s *Server) startAutoPlayLocked(interval time.Duration) error {
+	if s.auto.active {
+		return errors.New("auto play already running")
+	}
+	if s.engines[game.Bottom] == nil || s.engines[game.Top] == nil {
+		return errors.New("both players must be engines to start auto play")
+	}
+	if interval <= 0 {
+		interval = defaultAutoInterval
+	}
+	stop := make(chan struct{})
+	s.auto.active = true
+	s.auto.stopCh = stop
+	s.auto.interval = interval
+	go s.runAutoPlay(stop, interval)
+	return nil
+}
+
+func (s *Server) stopAutoPlayLocked() {
+	if !s.auto.active {
+		return
+	}
+	if s.auto.stopCh != nil {
+		close(s.auto.stopCh)
+	}
+	s.auto.active = false
+	s.auto.stopCh = nil
+}
+
+func (s *Server) runAutoPlay(stop <-chan struct{}, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-stop:
+			return
+		case <-ticker.C:
+			s.mu.Lock()
+			if !s.auto.active {
+				s.mu.Unlock()
+				return
+			}
+			if game.IsCheckmate(s.game, s.game.Turn) {
+				s.auto.active = false
+				s.auto.stopCh = nil
+				s.mu.Unlock()
+				return
+			}
+			engine := s.engines[s.game.Turn]
+			if engine == nil {
+				s.auto.active = false
+				s.auto.stopCh = nil
+				s.mu.Unlock()
+				return
+			}
+			mv, err := engine.NextMove(s.game)
+			if err != nil {
+				log.Printf("auto play failed: %v", err)
+				s.auto.active = false
+				s.auto.stopCh = nil
+				s.mu.Unlock()
+				return
+			}
+			movingPlayer := s.game.Turn
+			game.ApplyMove(&s.game, mv)
+			s.game.Turn = s.game.Turn.Opponent()
+			s.recordMove(movingPlayer, mv, s.makeBoardPayload(s.game))
+			s.mu.Unlock()
+		}
+	}
 }

@@ -70,6 +70,11 @@
       border-radius: 4px;
       background: rgba(255, 255, 255, 0.6);
     }
+    #history-list li.active {
+      background: #ffe2b6;
+      font-weight: bold;
+      border: 1px solid rgba(0,0,0,0.15);
+    }
     #history-list li + li {
       margin-top: 4px;
     }
@@ -78,6 +83,27 @@
       font-size: 13px;
       color: #7a6644;
       padding: 8px 0;
+    }
+    .history-controls {
+      margin-top: 8px;
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 6px;
+    }
+    .history-controls button {
+      font-size: 12px;
+      padding: 6px 0;
+    }
+    #review-status {
+      margin-top: 4px;
+      font-size: 12px;
+      text-align: center;
+      min-height: 18px;
+      color: #6b4a1c;
+    }
+    #review-status.active {
+      font-weight: bold;
+      color: #c0392b;
     }
     #game-container {
       display: flex;
@@ -208,6 +234,13 @@
         <ol id="history-list"></ol>
       </div>
       <div id="history-empty">まだ指し手はありません</div>
+      <div class="history-controls">
+        <button id="history-start">初期</button>
+        <button id="history-prev">◀戻る</button>
+        <button id="history-next">進む▶</button>
+        <button id="history-latest">最新</button>
+      </div>
+      <div id="review-status"></div>
     </div>
     <div id="game-container">
       <div id="gote-hand" class="hand">
@@ -223,12 +256,21 @@
   <div id="status">読み込み中...</div>
   <div id="message"></div>
   <div class="controls">
-    <label>後手AI
-      <select id="engine-select">
+    <label>先手
+      <select id="engine-bottom" data-player="bottom" data-engine-select>
+        <option value="human" selected>人間</option>
         <option value="random">ランダム</option>
         <option value="alpha-beta">αβ探索</option>
       </select>
     </label>
+    <label>後手
+      <select id="engine-top" data-player="top" data-engine-select>
+        <option value="human">人間</option>
+        <option value="random" selected>ランダム</option>
+        <option value="alpha-beta">αβ探索</option>
+      </select>
+    </label>
+    <button id="auto-btn">AI対局開始</button>
     <button id="reset-btn">最初からやり直す</button>
     <button id="refresh-btn">再読込</button>
   </div>
@@ -238,11 +280,16 @@
     const COLS = 5;
     const OWNER_BOTTOM = "bottom";
     const OWNER_TOP = "top";
+    const AUTO_POLL_MS = 1200;
+    const AUTO_INTERVAL_MS = 1500;
 
     let state = null;
     let selected = null; // {type: 'board'|'hand', x,y, kind}
     let validMoves = [];
     let movesForKey = "";
+    let autoPollHandle = null;
+    let reviewIndex = 0;
+    let followLatest = true;
 
     const kindToText = {
       K: "王",
@@ -256,7 +303,14 @@
     window.addEventListener("load", () => {
       document.getElementById("reset-btn").onclick = resetGame;
       document.getElementById("refresh-btn").onclick = loadState;
-      document.getElementById("engine-select").onchange = onEngineChange;
+      document.getElementById("auto-btn").onclick = toggleAutoPlay;
+      document.getElementById("history-start").onclick = () => setReviewIndex(0);
+      document.getElementById("history-prev").onclick = () => shiftReview(-1);
+      document.getElementById("history-next").onclick = () => shiftReview(1);
+      document.getElementById("history-latest").onclick = () => jumpToLatest();
+      document.querySelectorAll("[data-engine-select]").forEach((select) => {
+        select.onchange = onEngineChange;
+      });
       loadState();
     });
 
@@ -275,6 +329,7 @@
       selected = null;
       validMoves = [];
       movesForKey = "";
+      clampReviewIndex();
       render();
     }
 
@@ -285,6 +340,8 @@
         selected = null;
         validMoves = [];
         movesForKey = "";
+        followLatest = true;
+        reviewIndex = 0;
         render();
         setMessage("リセットしました。");
       } catch (err) {
@@ -295,29 +352,39 @@
     async function onEngineChange(e) {
       const select = e.target;
       const choice = select.value;
+      const player = select.dataset.player || OWNER_TOP;
       try {
         await fetchJSON("/api/engine", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ engine: choice })
+          body: JSON.stringify({ engine: choice, player })
         });
         await fetchAndRenderState();
-        setMessage("後手AIを切り替えました。");
+        setMessage("エンジン設定を更新しました。");
       } catch (err) {
         setMessage(err.message || String(err));
-        if (state?.engine) {
-          select.value = state.engine;
+        const engines = state?.engines || {};
+        if (player === OWNER_TOP && (engines.top || state?.engine)) {
+          select.value = engines.top || state.engine;
+        } else if (player === OWNER_BOTTOM && engines.bottom) {
+          select.value = engines.bottom;
         }
       }
     }
 
     function render() {
       if (!state) return;
-      renderHands();
-      renderBoard();
+      clampReviewIndex();
+      const view = getActiveView();
+      if (!view) return;
+      renderHands(view);
+      renderBoard(view);
       renderHistory();
-      updateStatus();
-      updateEngineSelector();
+      renderReviewStatus();
+      updateStatus(view);
+      updateEngineSelectors();
+      updateAutoControls();
+      syncAutoPolling(!!state.autoPlaying);
     }
 
     function renderHistory() {
@@ -331,24 +398,31 @@
         return;
       }
       emptyEl.style.display = "none";
-      entries.forEach((entry) => {
+      const highlightIndex = !isLiveView() ? currentReviewIndex() : -1;
+      entries.forEach((entry, idx) => {
         const item = document.createElement("li");
         const label = entry.player === OWNER_BOTTOM ? "先手" : "後手";
         item.textContent = `${label} ${entry.move}`;
+        if (highlightIndex === idx + 1) {
+          item.classList.add("active");
+        }
+        item.onclick = () => setReviewIndex(idx + 1);
         list.appendChild(item);
       });
-      list.scrollTop = list.scrollHeight;
+      if (isLiveView()) {
+        list.scrollTop = list.scrollHeight;
+      }
     }
 
-    function renderHands() {
-      renderHand("gote-hand", OWNER_TOP);
-      renderHand("sente-hand", OWNER_BOTTOM);
+    function renderHands(view) {
+      renderHand("gote-hand", OWNER_TOP, view);
+      renderHand("sente-hand", OWNER_BOTTOM, view);
     }
 
-    function renderHand(elementId, owner) {
+    function renderHand(elementId, owner, view) {
       const handEl = document.getElementById(elementId);
       handEl.innerHTML = `<div class="hand-label">${owner === OWNER_BOTTOM ? "先手 (Bottom)" : "後手 (Top)"}</div>`;
-      const hand = state.hands?.[owner] || {};
+      const hand = view?.hands?.[owner] || {};
       const entries = Object.entries(hand);
       if (entries.length === 0) {
         const empty = document.createElement("div");
@@ -357,6 +431,7 @@
         handEl.appendChild(empty);
         return;
       }
+      const interactive = isLiveView() && !state.autoPlaying && state.turn === owner && !state.checkmate;
       entries.forEach(([kind, count]) => {
         const pieceEl = createPieceElement({ kind, owner, promoted: false, present: true });
         pieceEl.classList.add("hand-piece");
@@ -366,22 +441,21 @@
         countEl.textContent = `x${count}`;
         pieceEl.appendChild(countEl);
 
-        pieceEl.draggable = true;
-        pieceEl.onclick = async (e) => {
-          e.stopPropagation();
-          if (state.turn !== owner) return;
-          await setSelection({ type: "hand", kind, owner });
-        };
-        pieceEl.ondragstart = async (e) => {
-          if (state.turn !== owner) {
-            e.preventDefault();
-            return;
-          }
-          await setSelection({ type: "hand", kind, owner });
-          e.dataTransfer.setData("text/plain", JSON.stringify({ kind, type: "hand" }));
-        };
+        if (interactive) {
+          pieceEl.draggable = true;
+          pieceEl.onclick = async (e) => {
+            e.stopPropagation();
+            await setSelection({ type: "hand", kind, owner });
+          };
+          pieceEl.ondragstart = async (e) => {
+            await setSelection({ type: "hand", kind, owner });
+            e.dataTransfer.setData("text/plain", JSON.stringify({ kind, type: "hand" }));
+          };
+        } else {
+          pieceEl.draggable = false;
+        }
 
-        if (selected && selected.type === "hand" && selected.kind === kind && selected.owner === owner) {
+        if (interactive && selected && selected.type === "hand" && selected.kind === kind && selected.owner === owner) {
           pieceEl.classList.add("selected-hand");
         }
 
@@ -389,9 +463,10 @@
       });
     }
 
-    function renderBoard() {
+    function renderBoard(view) {
       const boardEl = document.getElementById("board");
       boardEl.innerHTML = "";
+      const interactive = isLiveView() && !state.autoPlaying && !state.checkmate;
       for (let displayRow = ROWS - 1; displayRow >= 0; displayRow--) {
         for (let x = 0; x < COLS; x++) {
           const y = displayRow;
@@ -399,27 +474,31 @@
           cell.className = "cell";
           const coord = coordToString(x, y);
 
-          if (selected && selected.type === "board" && selected.x === x && selected.y === y) {
+          if (interactive && selected && selected.type === "board" && selected.x === x && selected.y === y) {
             cell.classList.add("selected");
           }
 
-          if (isValidDestination(coord)) {
+          if (interactive && isValidDestination(coord)) {
             cell.classList.add("valid");
           }
 
           cell.onclick = async () => {
+            if (!interactive) return;
             await onCellClick(x, y);
           };
           cell.ondragover = (e) => {
+            if (!interactive) return;
             e.preventDefault();
             e.dataTransfer.dropEffect = "move";
           };
           cell.ondragenter = (e) => {
+            if (!interactive) return;
             e.preventDefault();
             cell.classList.add("drag-over");
           };
           cell.ondragleave = () => cell.classList.remove("drag-over");
           cell.ondrop = async (e) => {
+            if (!interactive) return;
             e.preventDefault();
             cell.classList.remove("drag-over");
             const raw = e.dataTransfer.getData("text/plain");
@@ -436,10 +515,11 @@
             await attemptMove(x, y);
           };
 
-          const piece = state.board && state.board[y] ? state.board[y][x] : null;
+          const row = view.board && view.board[y] ? view.board[y] : null;
+          const piece = row ? row[x] : null;
           if (piece && piece.present) {
             const pieceEl = createPieceElement(piece);
-            if (state.turn === piece.owner && !state.checkmate) {
+            if (interactive && state.turn === piece.owner) {
               pieceEl.draggable = true;
               pieceEl.ondragstart = async (e) => {
                 await setSelection({ type: "board", x, y, owner: piece.owner });
@@ -447,6 +527,7 @@
               };
             }
             pieceEl.onclick = async (e) => {
+              if (!interactive) return;
               e.stopPropagation();
               if (piece.owner !== state.turn) return;
               await setSelection({ type: "board", x, y, owner: piece.owner });
@@ -460,7 +541,7 @@
     }
 
     async function onCellClick(x, y) {
-      if (!state) return;
+      if (!state || !isLiveView() || state.autoPlaying) return;
       const piece = state.board[y][x];
       if (!selected) {
         if (piece?.present && piece.owner === state.turn) {
@@ -473,6 +554,22 @@
 
     async function attemptMove(x, y) {
       if (!selected) return;
+      if (!isLiveView()) {
+        setMessage("棋譜再生中は操作できません。最新局面を表示してください。");
+        selected = null;
+        validMoves = [];
+        movesForKey = "";
+        render();
+        return;
+      }
+      if (state?.autoPlaying) {
+        setMessage("AI対局中は指せません。");
+        selected = null;
+        validMoves = [];
+        movesForKey = "";
+        render();
+        return;
+      }
       await ensureMovesLoaded();
 
       const coord = coordToString(x, y);
@@ -510,6 +607,7 @@
           state = result.state || state;
         } else {
           state = result.state;
+          followLatest = true;
           setMessage(result.message || "");
           if (result.winner) {
             setMessage(`勝者: ${result.winner}`);
@@ -522,14 +620,20 @@
       selected = null;
       validMoves = [];
       movesForKey = "";
+      clampReviewIndex();
       render();
     }
 
     async function setSelection(sel) {
-      if (!state || state.turn !== sel.owner) {
+      if (!state || !isLiveView() || state.autoPlaying || state.turn !== sel.owner) {
         selected = null;
         validMoves = [];
         movesForKey = "";
+        if (state?.autoPlaying) {
+          setMessage("AI対局中は操作できません。");
+        } else if (!isLiveView()) {
+          setMessage("棋譜再生中は操作できません。最新局面を表示してください。");
+        }
         render();
         return;
       }
@@ -574,19 +678,33 @@
       return pieceEl;
     }
 
-    function updateStatus() {
+    function updateStatus(view) {
       const statusEl = document.getElementById("status");
-      if (!state) {
+      if (!state || !view) {
         statusEl.textContent = "未接続";
         return;
       }
-      if (state.checkmate && state.winner) {
-        statusEl.textContent = `勝者: ${state.winner}`;
+      if (view.checkmate && view.winner) {
+        statusEl.textContent = `勝者: ${view.winner}`;
         return;
       }
-      const turnText = state.turn === OWNER_BOTTOM ? "先手" : "後手";
+      const turnText = view.turn === OWNER_BOTTOM ? "先手" : "後手";
+      if (!isLiveView()) {
+        statusEl.textContent = `棋譜再生中: ${turnText}の手番`;
+        if (view.check) {
+          statusEl.textContent += "（王手）";
+        }
+        return;
+      }
+      if (state.autoPlaying) {
+        statusEl.textContent = `AI対局中 (${turnText}の手番)`;
+        if (view.check) {
+          statusEl.textContent += "（王手）";
+        }
+        return;
+      }
       statusEl.textContent = `${turnText}の手番`;
-      if (state.check) {
+      if (view.check) {
         statusEl.textContent += "（王手）";
       }
     }
@@ -596,10 +714,163 @@
       el.textContent = msg || "";
     }
 
-    function updateEngineSelector() {
-      const select = document.getElementById("engine-select");
-      if (!select || !state?.engine) return;
-      select.value = state.engine;
+    function updateEngineSelectors() {
+      const mapping = state?.engines || {};
+      const topSelect = document.getElementById("engine-top");
+      const bottomSelect = document.getElementById("engine-bottom");
+      if (topSelect) {
+        topSelect.value = mapping.top || state?.engine || "random";
+      }
+      if (bottomSelect) {
+        bottomSelect.value = mapping.bottom || "human";
+      }
+    }
+
+    function updateAutoControls() {
+      const btn = document.getElementById("auto-btn");
+      if (!btn) return;
+      const running = !!state?.autoPlaying;
+      btn.textContent = running ? "AI対局停止" : "AI対局開始";
+      if (running) {
+        btn.disabled = false;
+        return;
+      }
+      const engines = state?.engines || {};
+      const ready = engines.bottom && engines.top && engines.bottom !== "human" && engines.top !== "human";
+      btn.disabled = !ready;
+    }
+
+    async function toggleAutoPlay() {
+      if (!state) return;
+      const running = !state.autoPlaying;
+      try {
+        await fetchJSON("/api/auto", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ running, interval_ms: AUTO_INTERVAL_MS })
+        });
+        await fetchAndRenderState();
+        setMessage(running ? "AI対局を開始しました。" : "AI対局を停止しました。");
+      } catch (err) {
+        setMessage(err.message || String(err));
+      }
+    }
+
+    function syncAutoPolling(running) {
+      if (running) {
+        if (autoPollHandle) return;
+        autoPollHandle = setInterval(fetchAndRenderState, AUTO_POLL_MS);
+      } else if (autoPollHandle) {
+        clearInterval(autoPollHandle);
+        autoPollHandle = null;
+      }
+    }
+
+    function timelineLength() {
+      if (!state) return 0;
+      const historyCount = state.history ? state.history.length : 0;
+      return historyCount + 1;
+    }
+
+    function clampReviewIndex() {
+      if (!state) return;
+      const max = timelineLength() - 1;
+      if (max < 0) {
+        reviewIndex = 0;
+        return;
+      }
+      if (reviewIndex > max) reviewIndex = max;
+      if (reviewIndex < 0) reviewIndex = 0;
+    }
+
+    function currentReviewIndex() {
+      if (!state) return 0;
+      const max = timelineLength() - 1;
+      if (followLatest) {
+        return max;
+      }
+      const clamped = Math.max(0, Math.min(reviewIndex, max));
+      reviewIndex = clamped;
+      return clamped;
+    }
+
+    function getSnapshotAt(index) {
+      if (!state) return null;
+      if (index === 0) {
+        return state.initial || null;
+      }
+      const history = state.history || [];
+      const entry = history[index - 1];
+      return entry ? entry.snapshot : null;
+    }
+
+    function getActiveView() {
+      if (!state) return null;
+      const index = currentReviewIndex();
+      if (index === timelineLength() - 1) {
+        return state;
+      }
+      return getSnapshotAt(index) || state;
+    }
+
+    function isLiveView() {
+      if (!state) return false;
+      return followLatest && currentReviewIndex() === timelineLength() - 1;
+    }
+
+    function setReviewIndex(index) {
+      if (!state) return;
+      followLatest = false;
+      const max = timelineLength() - 1;
+      reviewIndex = Math.max(0, Math.min(index, max));
+      selected = null;
+      validMoves = [];
+      movesForKey = "";
+      render();
+    }
+
+    function shiftReview(delta) {
+      if (!state) return;
+      const target = currentReviewIndex() + delta;
+      setReviewIndex(target);
+    }
+
+    function jumpToLatest() {
+      if (!state) return;
+      followLatest = true;
+      const max = timelineLength() - 1;
+      reviewIndex = max < 0 ? 0 : max;
+      selected = null;
+      validMoves = [];
+      movesForKey = "";
+      render();
+    }
+
+    function renderReviewStatus() {
+      const el = document.getElementById("review-status");
+      if (!el || !state) return;
+      const total = timelineLength();
+      if (total <= 1) {
+        el.textContent = "";
+        el.classList.remove("active");
+        return;
+      }
+      if (isLiveView()) {
+        el.textContent = "最新局面を表示中";
+        el.classList.remove("active");
+        return;
+      }
+      const index = currentReviewIndex();
+      let label = "初期局面";
+      if (index > 0) {
+        const entry = state.history?.[index - 1];
+        if (entry) {
+          const turnLabel = entry.player === OWNER_BOTTOM ? "先手" : "後手";
+          label = `${index}手目 (${turnLabel} ${entry.move})`;
+        }
+      }
+      el.textContent = `棋譜再生: ${label}`;
+      el.classList.add("active");
     }
 
     function coordToString(x, y) {
