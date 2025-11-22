@@ -13,10 +13,10 @@ Go 製の簡易エンジンとブラウザ UI で遊べる「ごろごろしょ�
 
 | Scenario | Config   | Before (states/s) | After (states/s) |
 |----------|----------|-------------------|------------------|
-| opening  | fast     | 72,269            | 72,536           |
-| opening  | default  | 68,581            | 70,324           |
-| tactical_scramble | fast | 44,884 | 48,751 |
-| tactical_scramble | default | 51,388 | 53,254 |
+| opening  | fast     | 65,663            | 107,395          |
+| opening  | default  | 68,212            | 102,820          |
+| tactical_scramble | fast | 47,500 | 72,982 |
+| tactical_scramble | default | 51,044 | 80,380 |
 
 ## ルール
 - 実装に基づくルールの詳細は `docs/RULES.md` を参照してください（反則チェックは二歩など未対応のものがあります）。

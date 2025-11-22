@@ -397,20 +397,9 @@ func appendLegalMovesForPiece(state *GameState, from Coord, piece Piece, kingPos
 			continue
 		}
 
-		canPromote := canPromote(piece, to.Y)
-		promoteOptions := []bool{false}
-		if canPromote {
-			promoteOptions = append(promoteOptions, true)
-		}
-
-		for _, promote := range promoteOptions {
-			testMove := Move{From: &from, To: to, Promote: promote}
-			diff := applyMoveInPlace(state, testMove, player)
-			inCheck := playerInCheckAfterAppliedMove(state, player, diff, kingPos, kingFound)
-			if !inCheck && pieceHasBoardReach(state.Board[to.Y][to.X], to) {
-				moves = append(moves, testMove)
-			}
-			undoMove(state, diff)
+		tryAppendMove(state, from, to, false, player, kingPos, kingFound, &moves)
+		if canPromote(piece, to.Y) {
+			tryAppendMove(state, from, to, true, player, kingPos, kingFound, &moves)
 		}
 	}
 	return moves
@@ -429,16 +418,116 @@ func appendLegalDrops(state *GameState, player Player, pieceKind PieceType, king
 			if state.Board[y][x].Present || blockedColumns[x] {
 				continue
 			}
-			testMove := Move{Drop: &pieceKind, To: Coord{X: x, Y: y}}
-			diff := applyMoveInPlace(state, testMove, player)
-			inCheck := playerInCheckAfterAppliedMove(state, player, diff, kingPos, kingFound)
-			if !inCheck && pieceHasBoardReach(state.Board[y][x], testMove.To) {
-				moves = append(moves, testMove)
-			}
-			undoMove(state, diff)
+			tryAppendDrop(state, Coord{X: x, Y: y}, player, pieceKind, kingPos, kingFound, &moves)
 		}
 	}
 	return moves
+}
+
+func HasLegalMove(state GameState, player Player) bool {
+	statePtr := &state
+	kingPos, kingFound := findKing(state, player)
+	for y := 0; y < BoardRows; y++ {
+		for x := 0; x < BoardCols; x++ {
+			piece := state.Board[y][x]
+			if !piece.Present || piece.Owner != player {
+				continue
+			}
+			from := Coord{X: x, Y: y}
+			if pieceHasLegalMove(statePtr, from, piece, kingPos, kingFound) {
+				return true
+			}
+		}
+	}
+	for pieceKind, count := range state.Hands[player] {
+		if count == 0 {
+			continue
+		}
+		if dropHasLegalMove(statePtr, player, pieceKind, kingPos, kingFound) {
+			return true
+		}
+	}
+	return false
+}
+
+func pieceHasLegalMove(state *GameState, from Coord, piece Piece, kingPos Coord, kingFound bool) bool {
+	player := piece.Owner
+	for _, delta := range movementOffsets(piece) {
+		to := Coord{X: from.X + delta.X, Y: from.Y + delta.Y}
+		if !insideBoard(to) {
+			continue
+		}
+		dest := state.Board[to.Y][to.X]
+		if dest.Present && dest.Owner == player {
+			continue
+		}
+		if tryMove(state, from, to, false, player, kingPos, kingFound) {
+			return true
+		}
+		if canPromote(piece, to.Y) && tryMove(state, from, to, true, player, kingPos, kingFound) {
+			return true
+		}
+	}
+	return false
+}
+
+func dropHasLegalMove(state *GameState, player Player, pieceKind PieceType, kingPos Coord, kingFound bool) bool {
+	var blockedColumns [BoardCols]bool
+	if pieceKind == Pawn {
+		for x := 0; x < BoardCols; x++ {
+			blockedColumns[x] = columnHasUnpromotedPawn(state, player, x)
+		}
+	}
+	for y := 0; y < BoardRows; y++ {
+		for x := 0; x < BoardCols; x++ {
+			if state.Board[y][x].Present || blockedColumns[x] {
+				continue
+			}
+			if tryDrop(state, Coord{X: x, Y: y}, player, pieceKind, kingPos, kingFound) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func tryAppendMove(state *GameState, from, to Coord, promote bool, player Player, kingPos Coord, kingFound bool, moves *[]Move) bool {
+	if !tryMove(state, from, to, promote, player, kingPos, kingFound) {
+		return false
+	}
+	fromCopy := from
+	mv := Move{From: &fromCopy, To: to, Promote: promote}
+	*moves = append(*moves, mv)
+	return true
+}
+
+func tryAppendDrop(state *GameState, to Coord, player Player, pieceKind PieceType, kingPos Coord, kingFound bool, moves *[]Move) bool {
+	if tryDrop(state, to, player, pieceKind, kingPos, kingFound) {
+		kind := pieceKind
+		mv := Move{Drop: &kind, To: to}
+		*moves = append(*moves, mv)
+		return true
+	}
+	return false
+}
+
+func tryMove(state *GameState, from, to Coord, promote bool, player Player, kingPos Coord, kingFound bool) bool {
+	fromCopy := from
+	mv := Move{From: &fromCopy, To: to, Promote: promote}
+	diff := applyMoveInPlace(state, mv, player)
+	inCheck := playerInCheckAfterAppliedMove(state, player, diff, kingPos, kingFound)
+	valid := !inCheck && pieceHasBoardReach(state.Board[to.Y][to.X], to)
+	undoMove(state, diff)
+	return valid
+}
+
+func tryDrop(state *GameState, to Coord, player Player, pieceKind PieceType, kingPos Coord, kingFound bool) bool {
+	mv := Move{Drop: &pieceKind, To: to}
+	diff := applyMoveInPlace(state, mv, player)
+	inCheck := playerInCheckAfterAppliedMove(state, player, diff, kingPos, kingFound)
+	valid := !inCheck && pieceHasBoardReach(state.Board[to.Y][to.X], to)
+	undoMove(state, diff)
+	return valid
 }
 
 // pieceHasBoardReach ensures the piece still has at least one theoretical destination on the board.
