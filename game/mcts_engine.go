@@ -1,13 +1,19 @@
 package game
 
 import (
+	"bufio"
+	"bytes"
+	"compress/gzip"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"log"
 	"math"
 	"math/rand"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -92,6 +98,9 @@ func (e *MCTSEngine) NextMove(state GameState) (Move, error) {
 		return Move{}, errors.New("failed to choose move")
 	}
 	e.updateKnowledgeFromRoot(root, stateKey)
+	if err := e.SaveIfNeeded(); err != nil {
+		log.Printf("mcts: failed to persist knowledge: %v", err)
+	}
 	return *best.move, nil
 }
 
@@ -294,12 +303,50 @@ func (e *MCTSEngine) loadKnowledge() error {
 		}
 		return err
 	}
+	if len(data) >= 2 && data[0] == 0x1f && data[1] == 0x8b {
+		return e.loadCompressedKnowledge(data)
+	}
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 {
+		return nil
+	}
+	if trimmed[0] == '{' {
+		return e.loadLegacyJSON(trimmed)
+	}
+	return e.loadPlainKnowledge(trimmed)
+}
+
+func (e *MCTSEngine) loadCompressedKnowledge(data []byte) error {
+	reader, err := gzip.NewReader(bytes.NewReader(data))
+	if err != nil {
+		return err
+	}
+	defer reader.Close()
+	return e.loadFromReader(reader)
+}
+
+func (e *MCTSEngine) loadPlainKnowledge(data []byte) error {
+	return e.loadFromReader(bytes.NewReader(data))
+}
+
+func (e *MCTSEngine) loadFromReader(r io.Reader) error {
+	entries, err := decodeKnowledge(r)
+	if err != nil {
+		return err
+	}
+	e.knowledge = entries
+	return nil
+}
+
+func (e *MCTSEngine) loadLegacyJSON(data []byte) error {
 	var payload storedKnowledge
 	if err := json.Unmarshal(data, &payload); err != nil {
 		return err
 	}
 	if payload.States != nil {
 		e.knowledge = payload.States
+	} else {
+		e.knowledge = make(map[string]map[string]moveStats)
 	}
 	return nil
 }
@@ -311,12 +358,16 @@ func (e *MCTSEngine) saveLocked() error {
 	if err := os.MkdirAll(filepath.Dir(e.storagePath), 0o755); err != nil {
 		return err
 	}
-	payload := storedKnowledge{States: e.knowledge}
-	data, err := json.MarshalIndent(payload, "", "  ")
-	if err != nil {
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	if err := encodeKnowledge(gz, e.knowledge); err != nil {
+		gz.Close()
 		return err
 	}
-	if err := os.WriteFile(e.storagePath, data, 0o644); err != nil {
+	if err := gz.Close(); err != nil {
+		return err
+	}
+	if err := os.WriteFile(e.storagePath, buf.Bytes(), 0o644); err != nil {
 		return err
 	}
 	e.dirty = false
@@ -352,4 +403,84 @@ func encodeStateKey(state GameState) string {
 		}
 	}
 	return b.String()
+}
+
+func encodeKnowledge(w io.Writer, knowledge map[string]map[string]moveStats) error {
+	bw := bufio.NewWriter(w)
+	keys := make([]string, 0, len(knowledge))
+	for key := range knowledge {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		line := key
+		moves := knowledge[key]
+		if len(moves) > 0 {
+			moveKeys := make([]string, 0, len(moves))
+			for mv := range moves {
+				moveKeys = append(moveKeys, mv)
+			}
+			sort.Strings(moveKeys)
+			parts := make([]string, 0, len(moveKeys))
+			for _, mv := range moveKeys {
+				stats := moves[mv]
+				wins := strconv.FormatFloat(stats.Wins, 'g', -1, 64)
+				parts = append(parts, mv+":"+strconv.Itoa(stats.Visits)+":"+wins)
+			}
+			line += "\t" + strings.Join(parts, ",")
+		}
+		if _, err := bw.WriteString(line + "\n"); err != nil {
+			return err
+		}
+	}
+	return bw.Flush()
+}
+
+func decodeKnowledge(r io.Reader) (map[string]map[string]moveStats, error) {
+	scanner := bufio.NewScanner(r)
+	entries := make(map[string]map[string]moveStats)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		stateKey, movePart, found := strings.Cut(line, "\t")
+		if !found {
+			movePart = ""
+		}
+		if stateKey == "" {
+			return nil, errors.New("invalid knowledge line: missing state key")
+		}
+		moves := make(map[string]moveStats)
+		if movePart != "" {
+			segments := strings.Split(movePart, ",")
+			for _, segment := range segments {
+				if segment == "" {
+					continue
+				}
+				move, rest, ok := strings.Cut(segment, ":")
+				if !ok {
+					return nil, fmt.Errorf("invalid move entry: %q", segment)
+				}
+				visitsStr, winsStr, ok := strings.Cut(rest, ":")
+				if !ok {
+					return nil, fmt.Errorf("invalid move stats: %q", segment)
+				}
+				visits, err := strconv.Atoi(visitsStr)
+				if err != nil {
+					return nil, fmt.Errorf("invalid visits value %q", visitsStr)
+				}
+				wins, err := strconv.ParseFloat(winsStr, 64)
+				if err != nil {
+					return nil, fmt.Errorf("invalid wins value %q", winsStr)
+				}
+				moves[move] = moveStats{Visits: visits, Wins: wins}
+			}
+		}
+		entries[stateKey] = moves
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	return entries, nil
 }
