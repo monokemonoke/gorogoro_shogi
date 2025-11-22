@@ -38,6 +38,7 @@ const (
 	engineRandom            = "random"
 	engineAlphaBeta         = "alpha-beta"
 	engineAlphaBetaMobility = "alpha-beta-mobility"
+	engineTDUCB             = "td-ucb"
 	engineMCTS              = "mcts"
 	engineHuman             = "human"
 	defaultAutoInterval     = 1500 * time.Millisecond
@@ -820,11 +821,16 @@ func (s *Server) setEngine(player game.Player, kind string) error {
 }
 
 func (s *Server) buildEngine(mode string, player game.Player) (game.Engine, error) {
-	if mode == engineMCTS {
+	switch mode {
+	case engineMCTS:
 		path := filepath.Join(s.dataDir, fmt.Sprintf("mcts_%s.json", playerKey(player)))
 		return game.NewPersistentMCTSEngine(800, time.Now().UnixNano(), path), nil
+	case engineTDUCB:
+		path := filepath.Join(s.dataDir, fmt.Sprintf("td_ucb_%s.gz", playerKey(player)))
+		return game.NewPersistentTDUCBEngine(time.Now().UnixNano(), path), nil
+	default:
+		return newEngineForMode(mode)
 	}
-	return newEngineForMode(mode)
 }
 
 func newEngineForMode(mode string) (game.Engine, error) {
@@ -835,6 +841,8 @@ func newEngineForMode(mode string) (game.Engine, error) {
 		return game.NewAlphaBetaEngine(3), nil
 	case engineAlphaBetaMobility:
 		return game.NewMobilityAlphaBetaEngine(3), nil
+	case engineTDUCB:
+		return game.NewTDUCBEngine(time.Now().UnixNano()), nil
 	case engineMCTS:
 		return game.NewMCTSEngine(800, time.Now().UnixNano()), nil
 	default:
@@ -1202,7 +1210,7 @@ func (tm *trainingManager) makeEngineFactory(mode string, player game.Player) (*
 		}
 	}
 	factory := &trainingEngineFactory{
-		shared: mode == engineMCTS && usePersistent,
+		shared: (mode == engineMCTS || mode == engineTDUCB) && usePersistent,
 	}
 	factory.builder = func() (game.Engine, error) {
 		return builder(mode, player)
