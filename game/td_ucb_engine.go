@@ -40,11 +40,102 @@ type TDUCBEngine struct {
 	storagePath string
 	dirty       bool
 	mu          sync.Mutex
+	profiler    tdProfiler
 }
 
 type tdMoveStat struct {
 	visits int
 	total  float64
+}
+
+// TDUCBProfile summarizes time spent in key sections of the TD rollouts.
+type TDUCBProfile struct {
+	NextMove        TDProfileMetric `json:"nextMove"`
+	Simulation      TDProfileMetric `json:"simulation"`
+	MoveSelection   TDProfileMetric `json:"moveSelection"`
+	LegalGeneration TDProfileMetric `json:"legalGeneration"`
+	MoveApply       TDProfileMetric `json:"moveApply"`
+}
+
+// TDProfileMetric exposes aggregate timing data in milliseconds.
+type TDProfileMetric struct {
+	Count   int64   `json:"count"`
+	TotalMS float64 `json:"totalMs"`
+	AvgMS   float64 `json:"avgMs"`
+	MaxMS   float64 `json:"maxMs"`
+}
+
+type tdMetric struct {
+	count int64
+	total time.Duration
+	max   time.Duration
+}
+
+func (m *tdMetric) add(duration time.Duration) {
+	m.count++
+	m.total += duration
+	if duration > m.max {
+		m.max = duration
+	}
+}
+
+func (m tdMetric) snapshot() TDProfileMetric {
+	if m.count == 0 {
+		return TDProfileMetric{}
+	}
+	total := durationToMillis(m.total)
+	return TDProfileMetric{
+		Count:   m.count,
+		TotalMS: total,
+		AvgMS:   total / float64(m.count),
+		MaxMS:   durationToMillis(m.max),
+	}
+}
+
+type tdProfiler struct {
+	nextMove        tdMetric
+	simulation      tdMetric
+	moveSelection   tdMetric
+	legalGeneration tdMetric
+	moveApply       tdMetric
+}
+
+func (p *tdProfiler) observeNextMove(duration time.Duration) {
+	p.nextMove.add(duration)
+}
+
+func (p *tdProfiler) observeSimulation(duration time.Duration) {
+	p.simulation.add(duration)
+}
+
+func (p *tdProfiler) observeMoveSelection(duration time.Duration) {
+	p.moveSelection.add(duration)
+}
+
+func (p *tdProfiler) observeLegalGeneration(duration time.Duration) {
+	p.legalGeneration.add(duration)
+}
+
+func (p *tdProfiler) observeMoveApply(duration time.Duration) {
+	p.moveApply.add(duration)
+}
+
+func (p *tdProfiler) snapshot() TDUCBProfile {
+	return TDUCBProfile{
+		NextMove:        p.nextMove.snapshot(),
+		Simulation:      p.simulation.snapshot(),
+		MoveSelection:   p.moveSelection.snapshot(),
+		LegalGeneration: p.legalGeneration.snapshot(),
+		MoveApply:       p.moveApply.snapshot(),
+	}
+}
+
+func (p *tdProfiler) reset() {
+	*p = tdProfiler{}
+}
+
+func durationToMillis(d time.Duration) float64 {
+	return float64(d) / float64(time.Millisecond)
 }
 
 func (s *tdMoveStat) mean() float64 {
@@ -83,9 +174,25 @@ func newTDUCBEngine(seed int64, storagePath string) *TDUCBEngine {
 	}
 }
 
+// ProfileSnapshot returns a copy of the current profiling totals.
+func (e *TDUCBEngine) ProfileSnapshot() TDUCBProfile {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.profiler.snapshot()
+}
+
+// ResetProfile clears the accumulated profiling metrics.
+func (e *TDUCBEngine) ResetProfile() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.profiler.reset()
+}
+
 func (e *TDUCBEngine) NextMove(state GameState) (Move, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	start := time.Now()
+	defer e.profiler.observeNextMove(time.Since(start))
 
 	legal := GenerateLegalMoves(state, state.Turn)
 	if len(legal) == 0 {
@@ -119,10 +226,14 @@ func (e *TDUCBEngine) NextMove(state GameState) (Move, error) {
 
 func (e *TDUCBEngine) runSimulation(root GameState) {
 	e.markDirty()
+	simStart := time.Now()
+	defer e.profiler.observeSimulation(time.Since(simStart))
 	state := CloneState(root)
 	for depth := 0; depth < e.depth; depth++ {
 		key := e.stateKey(state)
+		legalStart := time.Now()
 		legal := GenerateLegalMoves(state, state.Turn)
+		e.profiler.observeLegalGeneration(time.Since(legalStart))
 		if len(legal) == 0 {
 			if InCheck(state, state.Turn) {
 				e.values[key] = e.outcomeForBottom(state.Turn.Opponent())
@@ -134,7 +245,9 @@ func (e *TDUCBEngine) runSimulation(root GameState) {
 
 		move := e.selectSimulationMove(state, key, legal)
 		next := CloneState(state)
+		applyStart := time.Now()
 		ApplyMove(&next, move)
+		e.profiler.observeMoveApply(time.Since(applyStart))
 		mover := state.Turn
 		next.Turn = mover.Opponent()
 
@@ -160,6 +273,8 @@ func (e *TDUCBEngine) runSimulation(root GameState) {
 }
 
 func (e *TDUCBEngine) selectSimulationMove(state GameState, key string, legal []Move) Move {
+	start := time.Now()
+	defer e.profiler.observeMoveSelection(time.Since(start))
 	stats := e.moveStats[key]
 	if stats == nil {
 		stats = make(map[string]*tdMoveStat)
@@ -199,7 +314,9 @@ func (e *TDUCBEngine) selectSimulationMove(state GameState, key string, legal []
 }
 
 func (e *TDUCBEngine) evaluateOutcome(state GameState, mover Player) (float64, bool) {
+	start := time.Now()
 	legal := GenerateLegalMoves(state, state.Turn)
+	e.profiler.observeLegalGeneration(time.Since(start))
 	if len(legal) > 0 {
 		return 0, false
 	}

@@ -89,6 +89,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/move", s.handleMove)
 	mux.HandleFunc("/api/reset", s.handleReset)
 	mux.HandleFunc("/api/engine", s.handleEngine)
+	mux.HandleFunc("/api/engine/profile", s.handleEngineProfile)
 	mux.HandleFunc("/api/auto", s.handleAuto)
 	mux.HandleFunc("/api/training", s.handleTraining)
 	mux.HandleFunc("/api/training/game", s.handleTrainingGame)
@@ -324,6 +325,11 @@ type engineRequest struct {
 	Engine string `json:"engine"`
 }
 
+type engineProfileResponse struct {
+	Player  string            `json:"player"`
+	Profile game.TDUCBProfile `json:"profile"`
+}
+
 type autoRequest struct {
 	Running    bool `json:"running"`
 	IntervalMS int  `json:"interval_ms"`
@@ -426,6 +432,41 @@ func (s *Server) handleEngine(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
+}
+
+func (s *Server) handleEngineProfile(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	playerParam := strings.TrimSpace(r.URL.Query().Get("player"))
+	player, ok := parsePlayer(playerParam)
+	if !ok {
+		http.Error(w, "unknown player for profile", http.StatusBadRequest)
+		return
+	}
+
+	s.mu.Lock()
+	eng := s.engines[player]
+	s.mu.Unlock()
+
+	if eng == nil {
+		http.Error(w, "no engine configured for player", http.StatusBadRequest)
+		return
+	}
+	profilable, ok := eng.(tdProfilableEngine)
+	if !ok {
+		http.Error(w, "selected engine has no TD profiling data", http.StatusBadRequest)
+		return
+	}
+	profile := profilable.ProfileSnapshot()
+	if shouldResetProfile(r.URL.Query().Get("reset")) {
+		profilable.ResetProfile()
+	}
+	writeJSON(w, http.StatusOK, engineProfileResponse{
+		Player:  playerKey(player),
+		Profile: profile,
+	})
 }
 
 func (s *Server) handleAuto(w http.ResponseWriter, r *http.Request) {
@@ -685,6 +726,15 @@ func parsePlayer(value string) (game.Player, bool) {
 	}
 }
 
+func shouldResetProfile(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "1", "true", "yes", "y", "reset":
+		return true
+	default:
+		return false
+	}
+}
+
 func (s *Server) respondWithEngines() ([]string, error) {
 	var responses []string
 	for {
@@ -761,6 +811,11 @@ func (s *Server) recordMove(player game.Player, mv game.Move, snapshot boardPayl
 		Move:     game.FormatMove(mv),
 		Snapshot: snapshot,
 	})
+}
+
+type tdProfilableEngine interface {
+	ProfileSnapshot() game.TDUCBProfile
+	ResetProfile()
 }
 
 type savableEngine interface {

@@ -62,6 +62,7 @@ func BenchmarkTDUCBEngineStatesPerSecond(b *testing.B) {
 				}
 
 				b.ReportAllocs()
+				engine.ResetProfile()
 				b.ResetTimer()
 				for i := 0; i < b.N; i++ {
 					if _, err := engine.NextMove(state); err != nil {
@@ -77,7 +78,30 @@ func BenchmarkTDUCBEngineStatesPerSecond(b *testing.B) {
 					// which captures the upper bound of positions evaluated.
 					b.ReportMetric(totalStates/elapsedSeconds, "states/s")
 				}
+				profile := engine.ProfileSnapshot()
+				reportTDProfilingMetrics(b, profile, b.N)
 			})
 		}
 	}
+}
+
+func reportTDProfilingMetrics(b *testing.B, profile TDUCBProfile, runs int) {
+	if runs == 0 {
+		return
+	}
+	reportMetricMS := func(metric TDProfileMetric, name string, divisor float64) {
+		if metric.Count == 0 {
+			return
+		}
+		value := metric.TotalMS / divisor
+		if value > 0 {
+			b.ReportMetric(value, name)
+		}
+	}
+	runsF := float64(runs)
+	reportMetricMS(profile.NextMove, "td_next_ms/op", runsF)
+	reportMetricMS(profile.Simulation, "td_sim_ms/op", runsF)
+	reportMetricMS(profile.MoveSelection, "td_select_ms/op", runsF)
+	reportMetricMS(profile.LegalGeneration, "td_legal_ms/op", runsF)
+	reportMetricMS(profile.MoveApply, "td_apply_ms/op", runsF)
 }

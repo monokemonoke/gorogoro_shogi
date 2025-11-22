@@ -12,3 +12,8 @@ Go 製の簡易エンジンとブラウザ UI で遊べる「ごろごろしょ�
 
 ## ルール
 - 実装に基づくルールの詳細は `docs/RULES.md` を参照してください（反則チェックは二歩など未対応のものがあります）。
+
+## TD エンジンのプロファイリング
+- TD-UCB エンジンが有効なプレイヤーに対して `GET /api/engine/profile?player=top` を叩くと、直近で積算した主要処理の時間（ミリ秒）が JSON で得られます。
+- `reset=1` をクエリに付けると、レスポンス返却後にカウンタをクリアできます。必要なシナリオでだけ値を集めたい場合に利用してください。
+- `go test -bench=BenchmarkTDUCBEngineStatesPerSecond ./game -run=^$` を実行すると、states/s に加えて `td_next_ms/op`（NextMove 全体）、`td_sim_ms/op`（シミュレーション合計）など、内部処理ごとの平均ミリ秒もベンチ結果に含まれます。
