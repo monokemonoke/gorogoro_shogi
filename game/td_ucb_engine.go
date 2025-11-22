@@ -405,10 +405,7 @@ func (e *TDUCBEngine) writeKnowledge(path string) error {
 	}
 	defer file.Close()
 
-	gz := gzip.NewWriter(file)
-	defer gz.Close()
-
-	writer := bufio.NewWriter(gz)
+	writer := bufio.NewWriter(file)
 	for key, value := range e.values {
 		if _, err := fmt.Fprintf(writer, "%s\t%s\t%.8f\n", tdRecordState, key, value); err != nil {
 			return err
@@ -444,13 +441,19 @@ func (e *TDUCBEngine) loadKnowledge() error {
 	}
 	defer file.Close()
 
-	gz, err := gzip.NewReader(file)
-	if err != nil {
-		return err
+	reader := bufio.NewReader(file)
+	var scanner *bufio.Scanner
+	header, err := reader.Peek(2)
+	if err == nil && len(header) == 2 && header[0] == 0x1f && header[1] == 0x8b {
+		gz, err := gzip.NewReader(reader)
+		if err != nil {
+			return err
+		}
+		defer gz.Close()
+		scanner = bufio.NewScanner(gz)
+	} else {
+		scanner = bufio.NewScanner(reader)
 	}
-	defer gz.Close()
-
-	scanner := bufio.NewScanner(gz)
 	for scanner.Scan() {
 		line := scanner.Text()
 		if err := e.parseRecord(line); err != nil {
