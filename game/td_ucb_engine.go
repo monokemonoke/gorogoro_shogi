@@ -23,7 +23,6 @@ const (
 	defaultTDGamma       = 0.95
 	defaultTDExploration = 0.9
 	tdRecordState        = "S"
-	tdRecordMove         = "M"
 )
 
 // TDUCBEngine learns a simple value function with TD(0) updates and uses UCB to
@@ -406,20 +405,10 @@ func (e *TDUCBEngine) writeKnowledge(path string) error {
 	defer file.Close()
 
 	writer := bufio.NewWriter(file)
+	// Persist only the TD state values, move statistics remain in memory.
 	for key, value := range e.values {
 		if _, err := fmt.Fprintf(writer, "%s\t%s\t%.8f\n", tdRecordState, key, value); err != nil {
 			return err
-		}
-	}
-	for stateKey, moves := range e.moveStats {
-		for moveKey, stat := range moves {
-			if stat.visits == 0 {
-				continue
-			}
-			if _, err := fmt.Fprintf(writer, "%s\t%s\t%s\t%d\t%.8f\n",
-				tdRecordMove, stateKey, moveKey, stat.visits, stat.total); err != nil {
-				return err
-			}
 		}
 	}
 	if err := writer.Flush(); err != nil {
@@ -481,24 +470,6 @@ func (e *TDUCBEngine) parseRecord(line string) error {
 			return err
 		}
 		e.values[fields[1]] = value
-	case tdRecordMove:
-		if len(fields) != 5 {
-			return fmt.Errorf("td-ucb: malformed move record")
-		}
-		visits, err := strconv.Atoi(fields[3])
-		if err != nil {
-			return err
-		}
-		total, err := strconv.ParseFloat(fields[4], 64)
-		if err != nil {
-			return err
-		}
-		stats := e.moveStats[fields[1]]
-		if stats == nil {
-			stats = make(map[string]*tdMoveStat)
-			e.moveStats[fields[1]] = stats
-		}
-		stats[fields[2]] = &tdMoveStat{visits: visits, total: total}
 	default:
 		return fmt.Errorf("td-ucb: unknown record kind %q", fields[0])
 	}
