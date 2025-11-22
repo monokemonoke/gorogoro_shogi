@@ -231,6 +231,7 @@ func (e *TDUCBEngine) runSimulation(root GameState) {
 	state := CloneState(root)
 	for depth := 0; depth < e.depth; depth++ {
 		key := e.stateKey(state)
+		currentValue := e.stateValue(state)
 		legalStart := time.Now()
 		legal := GenerateLegalMoves(state, state.Turn)
 		e.profiler.observeLegalGeneration(time.Since(legalStart))
@@ -244,24 +245,21 @@ func (e *TDUCBEngine) runSimulation(root GameState) {
 		}
 
 		move := e.selectSimulationMove(state, key, legal)
-		next := CloneState(state)
-		applyStart := time.Now()
-		ApplyMove(&next, move)
-		e.profiler.observeMoveApply(time.Since(applyStart))
 		mover := state.Turn
-		next.Turn = mover.Opponent()
+		applyStart := time.Now()
+		ApplyMove(&state, move)
+		e.profiler.observeMoveApply(time.Since(applyStart))
+		state.Turn = mover.Opponent()
 
-		reward, terminal := e.evaluateOutcome(next, mover)
+		reward, terminal := e.evaluateOutcome(state, mover)
 		target := reward
 		if !terminal {
-			target += e.gamma * e.stateValue(next)
+			target += e.gamma * e.stateValue(state)
 		}
 
-		current := e.stateValue(state)
-		e.values[key] = current + e.alpha*(target-current)
+		e.values[key] = currentValue + e.alpha*(target-currentValue)
 		e.updateMoveStats(key, move, target)
 
-		state = next
 		if terminal {
 			doneKey := e.stateKey(state)
 			if _, ok := e.values[doneKey]; !ok {
