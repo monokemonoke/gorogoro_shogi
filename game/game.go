@@ -345,16 +345,22 @@ func undoMove(state *GameState, diff moveDiff) {
 }
 
 func GenerateLegalMoves(state GameState, player Player) []Move {
-	var moves []Move
+	statePtr := &state
+	kingPos, kingFound := findKing(state, player)
+	moves := make([]Move, 0, 48)
 	for y := 0; y < BoardRows; y++ {
 		for x := 0; x < BoardCols; x++ {
+			piece := state.Board[y][x]
+			if !piece.Present || piece.Owner != player {
+				continue
+			}
 			from := Coord{X: x, Y: y}
-			moves = append(moves, GenerateLegalMovesFrom(state, player, from)...)
+			moves = appendLegalMovesForPiece(statePtr, from, piece, kingPos, kingFound, moves)
 		}
 	}
 
 	for dropType := range state.Hands[player] {
-		moves = append(moves, GenerateLegalDrops(state, player, dropType)...)
+		moves = appendLegalDrops(statePtr, player, dropType, kingPos, kingFound, moves)
 	}
 	return moves
 }
@@ -367,21 +373,20 @@ func GenerateLegalMovesFrom(state GameState, player Player, from Coord) []Move {
 	if !piece.Present || piece.Owner != player {
 		return nil
 	}
-	return legalMovesForPiece(state, from, piece)
+	kingPos, kingFound := findKing(state, player)
+	return appendLegalMovesForPiece(&state, from, piece, kingPos, kingFound, nil)
 }
 
 func GenerateLegalDrops(state GameState, player Player, pieceKind PieceType) []Move {
 	if state.Hands[player][pieceKind] == 0 {
 		return nil
 	}
-	return legalDropsForPiece(state, player, pieceKind)
+	kingPos, kingFound := findKing(state, player)
+	return appendLegalDrops(&state, player, pieceKind, kingPos, kingFound, nil)
 }
 
-func legalMovesForPiece(state GameState, from Coord, piece Piece) []Move {
+func appendLegalMovesForPiece(state *GameState, from Coord, piece Piece, kingPos Coord, kingFound bool, moves []Move) []Move {
 	player := piece.Owner
-	statePtr := &state
-	kingPos, kingFound := findKing(state, player)
-	var moves []Move
 	for _, delta := range movementOffsets(piece) {
 		to := Coord{X: from.X + delta.X, Y: from.Y + delta.Y}
 		if !insideBoard(to) {
@@ -400,43 +405,37 @@ func legalMovesForPiece(state GameState, from Coord, piece Piece) []Move {
 
 		for _, promote := range promoteOptions {
 			testMove := Move{From: &from, To: to, Promote: promote}
-			diff := applyMoveInPlace(statePtr, testMove, player)
-			inCheck := playerInCheckAfterAppliedMove(statePtr, player, diff, kingPos, kingFound)
-			if !inCheck && pieceHasBoardReach(statePtr.Board[to.Y][to.X], to) {
+			diff := applyMoveInPlace(state, testMove, player)
+			inCheck := playerInCheckAfterAppliedMove(state, player, diff, kingPos, kingFound)
+			if !inCheck && pieceHasBoardReach(state.Board[to.Y][to.X], to) {
 				moves = append(moves, testMove)
 			}
-			undoMove(statePtr, diff)
+			undoMove(state, diff)
 		}
 	}
 	return moves
 }
 
-func legalDropsForPiece(state GameState, player Player, pieceKind PieceType) []Move {
+func appendLegalDrops(state *GameState, player Player, pieceKind PieceType, kingPos Coord, kingFound bool, moves []Move) []Move {
 	// Pawn drops are blocked on files that already contain an unpromoted pawn of the same player (nifu).
-	blockedColumns := map[int]bool{}
+	var blockedColumns [BoardCols]bool
 	if pieceKind == Pawn {
 		for x := 0; x < BoardCols; x++ {
 			blockedColumns[x] = columnHasUnpromotedPawn(state, player, x)
 		}
 	}
-	var moves []Move
-	statePtr := &state
-	kingPos, kingFound := findKing(state, player)
 	for y := 0; y < BoardRows; y++ {
 		for x := 0; x < BoardCols; x++ {
-			if state.Board[y][x].Present {
-				continue
-			}
-			if blockedColumns[x] {
+			if state.Board[y][x].Present || blockedColumns[x] {
 				continue
 			}
 			testMove := Move{Drop: &pieceKind, To: Coord{X: x, Y: y}}
-			diff := applyMoveInPlace(statePtr, testMove, player)
-			inCheck := playerInCheckAfterAppliedMove(statePtr, player, diff, kingPos, kingFound)
-			if !inCheck && pieceHasBoardReach(statePtr.Board[y][x], testMove.To) {
+			diff := applyMoveInPlace(state, testMove, player)
+			inCheck := playerInCheckAfterAppliedMove(state, player, diff, kingPos, kingFound)
+			if !inCheck && pieceHasBoardReach(state.Board[y][x], testMove.To) {
 				moves = append(moves, testMove)
 			}
-			undoMove(statePtr, diff)
+			undoMove(state, diff)
 		}
 	}
 	return moves
@@ -456,7 +455,7 @@ func pieceHasBoardReach(piece Piece, at Coord) bool {
 	return false
 }
 
-func columnHasUnpromotedPawn(state GameState, player Player, column int) bool {
+func columnHasUnpromotedPawn(state *GameState, player Player, column int) bool {
 	for y := 0; y < BoardRows; y++ {
 		p := state.Board[y][column]
 		if !p.Present {
@@ -473,36 +472,57 @@ func insideBoard(c Coord) bool {
 	return c.X >= 0 && c.X < BoardCols && c.Y >= 0 && c.Y < BoardRows
 }
 
-func movementOffsets(p Piece) []Coord {
-	// Gold movement is used for promoted pawns and silvers.
-	forward := 1
-	if p.Owner == Top {
-		forward = -1
+var (
+	kingOffsets = []Coord{
+		{X: -1, Y: -1}, {X: 0, Y: -1}, {X: 1, Y: -1},
+		{X: -1, Y: 0}, {X: 1, Y: 0},
+		{X: -1, Y: 1}, {X: 0, Y: 1}, {X: 1, Y: 1},
 	}
+	goldOffsetsBottom = []Coord{
+		{X: -1, Y: 1}, {X: 0, Y: 1}, {X: 1, Y: 1},
+		{X: -1, Y: 0}, {X: 1, Y: 0},
+		{X: 0, Y: -1},
+	}
+	goldOffsetsTop = []Coord{
+		{X: -1, Y: -1}, {X: 0, Y: -1}, {X: 1, Y: -1},
+		{X: -1, Y: 0}, {X: 1, Y: 0},
+		{X: 0, Y: 1},
+	}
+	silverOffsetsBottom = []Coord{
+		{X: -1, Y: 1}, {X: 0, Y: 1}, {X: 1, Y: 1},
+		{X: -1, Y: -1}, {X: 1, Y: -1},
+	}
+	silverOffsetsTop = []Coord{
+		{X: -1, Y: -1}, {X: 0, Y: -1}, {X: 1, Y: -1},
+		{X: -1, Y: 1}, {X: 1, Y: 1},
+	}
+	pawnOffsetsBottom = []Coord{{X: 0, Y: 1}}
+	pawnOffsetsTop    = []Coord{{X: 0, Y: -1}}
+)
 
-	switch {
-	case p.Kind == King:
-		return []Coord{
-			{X: -1, Y: -1}, {X: 0, Y: -1}, {X: 1, Y: -1},
-			{X: -1, Y: 0}, {X: 1, Y: 0},
-			{X: -1, Y: 1}, {X: 0, Y: 1}, {X: 1, Y: 1},
-		}
-	case p.Kind == Gold || p.Promoted:
-		return []Coord{
-			{X: -1, Y: forward}, {X: 0, Y: forward}, {X: 1, Y: forward},
-			{X: -1, Y: 0}, {X: 1, Y: 0},
-			{X: 0, Y: -forward},
-		}
-	case p.Kind == Silver:
-		return []Coord{
-			{X: -1, Y: forward}, {X: 0, Y: forward}, {X: 1, Y: forward},
-			{X: -1, Y: -forward}, {X: 1, Y: -forward},
-		}
-	case p.Kind == Pawn:
-		return []Coord{{X: 0, Y: forward}}
-	default:
-		return nil
+func movementOffsets(p Piece) []Coord {
+	if p.Kind == King {
+		return kingOffsets
 	}
+	if p.Kind == Gold || p.Promoted {
+		if p.Owner == Bottom {
+			return goldOffsetsBottom
+		}
+		return goldOffsetsTop
+	}
+	if p.Kind == Silver {
+		if p.Owner == Bottom {
+			return silverOffsetsBottom
+		}
+		return silverOffsetsTop
+	}
+	if p.Kind == Pawn {
+		if p.Owner == Bottom {
+			return pawnOffsetsBottom
+		}
+		return pawnOffsetsTop
+	}
+	return nil
 }
 
 func canPromote(p Piece, destY int) bool {

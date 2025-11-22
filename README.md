@@ -9,6 +9,14 @@ Go 製の簡易エンジンとブラウザ UI で遊べる「ごろごろしょ�
 
 ## ベンチマーク
 - TD エンジンが単位時間あたりに解析できる局面数は `go test -bench=BenchmarkTDUCBEngineStatesPerSecond ./game -run=^$` で測定できます。
+- 上記ベンチマークで測定した最適化前後の `states/s` は以下の通りで、すべてのシナリオで高速化されています（Apple M2, Go 1.25）。
+
+| Scenario | Config   | Before (states/s) | After (states/s) |
+|----------|----------|-------------------|------------------|
+| opening  | fast     | 44,632            | 71,958           |
+| opening  | default  | 42,096            | 67,939           |
+| tactical_scramble | fast | 40,648 | 46,901 |
+| tactical_scramble | default | 49,075 | 51,570 |
 
 ## ルール
 - 実装に基づくルールの詳細は `docs/RULES.md` を参照してください（反則チェックは二歩など未対応のものがあります）。
